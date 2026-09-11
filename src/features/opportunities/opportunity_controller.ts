@@ -1,0 +1,74 @@
+import { Request, Response } from "express"
+import type { AuthenticatedRequest } from "../../middleware/auth"
+import { assertProjectAccess } from "../projects/project_access"
+import { getOpportunities } from "./opportunity_service"
+import type { DashboardFilters } from "../dashboard/dashboard_service"
+import { createOpportunityAction } from "./opportunity_action_service"
+
+function parseFilters(query: Request["query"]): DashboardFilters {
+    const filters: DashboardFilters = {}
+    if (query.days) filters.days = parseInt(query.days as string, 10)
+    if (query.model && query.model !== "all") filters.model = query.model as string
+    if (query.topic && query.topic !== "all") filters.topic = query.topic as string
+    if (query.tag && query.tag !== "all") filters.tag = query.tag as string
+    if (query.prompt_id && query.prompt_id !== "all") filters.prompt_id = query.prompt_id as string
+    if (query.q) filters.q = query.q as string
+    if (query.country && query.country !== "all") filters.country = query.country as string
+    if (query.intent && query.intent !== "all") filters.intent = query.intent as string
+    if (query.mentioned === "true" || query.mentioned === "false") filters.mentioned = query.mentioned === "true"
+    if (query.cited === "true" || query.cited === "false") filters.cited = query.cited === "true"
+    return filters
+}
+
+export async function getOpportunitiesController(req: Request, res: Response): Promise<void> {
+    try {
+        const { project_id } = req.params
+        if (!project_id || Array.isArray(project_id)) {
+            res.status(400).json({ error: "project_id is required" })
+            return
+        }
+
+        await assertProjectAccess(project_id, (req as AuthenticatedRequest).user.id)
+        const data = await getOpportunities(project_id, parseFilters(req.query))
+        res.status(200).json(data)
+    } catch (error) {
+        if (error instanceof Error && error.message === "PROJECT_NOT_FOUND") {
+            res.status(404).json({ error: "Project not found" })
+            return
+        }
+        res.status(500).json({ error: "Failed to get opportunities" })
+    }
+}
+
+export async function createOpportunityActionController(req: Request, res: Response): Promise<void> {
+    try {
+        const { project_id, opportunity_id } = req.params
+        if (!project_id || Array.isArray(project_id) || !opportunity_id || Array.isArray(opportunity_id)) {
+            res.status(400).json({ error: "project_id and opportunity_id are required" })
+            return
+        }
+
+        const userId = (req as AuthenticatedRequest).user.id
+        await assertProjectAccess(project_id, userId)
+        const data = await getOpportunities(project_id, parseFilters(req.query))
+        const item = data.opportunities.find(opportunity => opportunity.id === opportunity_id)
+        if (!item) {
+            res.status(404).json({ error: "Opportunity not found in the current project evidence" })
+            return
+        }
+
+        const action = await createOpportunityAction({
+            projectId: project_id,
+            userId,
+            item,
+        })
+        res.status(201).json(action)
+    } catch (error) {
+        if (error instanceof Error && error.message === "PROJECT_NOT_FOUND") {
+            res.status(404).json({ error: "Project not found" })
+            return
+        }
+        console.error("[opportunities] Failed to create action:", error)
+        res.status(500).json({ error: "Failed to create opportunity action" })
+    }
+}
