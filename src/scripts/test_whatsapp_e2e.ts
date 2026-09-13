@@ -13,7 +13,7 @@ const result = await sendWhatsAppTextMessage(
     phoneNumberId,
     accessToken,
     recipientPhone,
-    "PromptPulse WhatsApp end-to-end test. Reply with OK when received.",
+    "DeepMention WhatsApp end-to-end test. Reply with OK when received.",
 )
 
 console.info(JSON.stringify({ ok: true, messageId: result.messages?.[0]?.id ?? null }))

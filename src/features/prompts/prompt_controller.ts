@@ -264,8 +264,13 @@ export const activatePromptController = async (req: Request, res: Response): Pro
         const prompt = await activatePrompt(prompt_id)
         res.status(200).json(prompt)
     } catch (error) {
-        const message = error instanceof Error ? error.message : 'Failed to activate prompt'
-        res.status(message.includes('plan') || message.includes('remaining') ? 400 : 500).json({ error: message })
+        const message = error instanceof Error ? error.message : ''
+        if (message.includes('plan') || message.includes('remaining')) {
+            res.status(400).json({ error: message })
+            return
+        }
+        console.error("[prompt_controller:activatePrompt]", error)
+        res.status(500).json({ error: 'Failed to activate prompt' })
     }
 }
 

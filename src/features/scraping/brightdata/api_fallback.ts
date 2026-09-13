@@ -27,7 +27,7 @@ export async function runApiFallback(
     try {
         const answer = await generateText(
             [
-                "You are an answer-engine API fallback for PromptPulse.",
+                "You are an answer-engine API fallback for DeepMention.",
                 "Answer the user prompt directly and clearly for brand visibility analysis.",
                 "Do not claim you used a live browser or Bright Data.",
                 "Do not invent citations or URLs. If you are not using live web search, avoid fake source lists.",

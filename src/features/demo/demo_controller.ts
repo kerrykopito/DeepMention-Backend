@@ -48,6 +48,11 @@ export async function bookDemoController(req: Request, res: Response): Promise<v
             message === "Demo time must be scheduled in the future" ? 400 :
             500
 
+        if (statusCode === 500) {
+            console.error("[demo_controller:bookDemo]", error)
+            res.status(500).json({ success: false, error: "Failed to book demo" })
+            return
+        }
         res.status(statusCode).json({
             success: false,
             error: message,
@@ -64,10 +69,10 @@ export async function getPendingDemosController(_req: Request, res: Response): P
             demos,
         })
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to get pending demos"
+        console.error("[demo_controller:getPendingDemos]", error)
         res.status(500).json({
             success: false,
-            error: message,
+            error: "Failed to get pending demos",
         })
     }
 }

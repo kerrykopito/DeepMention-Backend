@@ -7,8 +7,12 @@ export async function getProductTourStatusController(req: AuthenticatedRequest, 
         const status = await getProductTourStatus(req.user.id)
         res.status(200).json(status)
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to load product tour status"
-        res.status(message === "User not found" ? 404 : 500).json({ error: message })
+        if (error instanceof Error && error.message === "User not found") {
+            res.status(404).json({ error: error.message })
+            return
+        }
+        console.error("[product_tour_controller:getStatus]", error)
+        res.status(500).json({ error: "Failed to load product tour status" })
     }
 }
 
@@ -17,8 +21,8 @@ export async function completeProductTourController(req: AuthenticatedRequest, r
         const status = await completeProductTour(req.user.id)
         res.status(200).json(status)
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to update product tour status"
-        res.status(500).json({ error: message })
+        console.error("[product_tour_controller:complete]", error)
+        res.status(500).json({ error: "Failed to update product tour status" })
     }
 }
 

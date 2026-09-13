@@ -1,6 +1,7 @@
 import { Request, Response } from "express"
 import { AgencyInvitationType, AgencyMembershipRole } from "@prisma/client"
 import type { AuthenticatedRequest } from "../../middleware/auth"
+import { setAuthCookies } from "../../utils/auth_cookies"
 import {
     listAgencyClients,
     addAgencyClient,
@@ -40,8 +41,13 @@ function handleError(error: unknown, res: Response, fallback: string) {
     const status = typeof error === "object" && error && "status" in error
         ? Number((error as { status?: unknown }).status)
         : 500
-    const message = error instanceof Error ? error.message : fallback
-    res.status(Number.isFinite(status) && status >= 400 ? status : 500).json({ error: message })
+    // Only errors thrown with an explicit status carry a message meant for the client.
+    if (Number.isFinite(status) && status >= 400 && status < 500) {
+        res.status(status).json({ error: error instanceof Error ? error.message : fallback })
+        return
+    }
+    console.error("[agency_controller]", fallback, error)
+    res.status(500).json({ error: fallback })
 }
 
 // ─── Portfolio & Clients ──────────────────────────────────────────────────────
@@ -117,7 +123,12 @@ export async function acceptInvitationController(req: Request, res: Response): P
         return
     }
     try {
-        res.json({ success: true, invitation: await acceptAgencyInvitation(token, password) })
+        const invitation = await acceptAgencyInvitation(token, password)
+        // This endpoint mints a real session, and the page that calls it then does a full
+        // navigation — so it needs the same cookies as login, or the accepted invitee lands
+        // on the workspace unauthenticated.
+        setAuthCookies(res, invitation)
+        res.json({ success: true, invitation })
     } catch (error) {
         handleError(error, res, "Failed to accept invitation")
     }

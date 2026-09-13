@@ -16,7 +16,7 @@ function demandLabel(score: number | null): ObservedPromptDemand["label"] {
 }
 
 /**
- * Measures observed AI demand inside PromptPulse, not Google search volume.
+ * Measures observed AI demand inside DeepMention, not Google search volume.
  * A prompt earns a signal only from completed chat records in the last 30 days.
  */
 export async function getObservedPromptDemand(promptIds: string[]) {

@@ -1,3 +1,4 @@
+import "../lib/env"
 import "dotenv/config"
 import { PromptStatus, ScrapeJobStatus } from "@prisma/client"
 import prisma from "../lib/prisma"

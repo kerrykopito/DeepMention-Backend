@@ -1,4 +1,5 @@
 import bcrypt from 'bcryptjs'
+import crypto from 'crypto'
 import prisma from '../../lib/prisma'
 import { isWorkEmail, generateOtp } from '../../utils/email'
 import { generateAccessToken, generateRefreshToken } from '../../utils/jwt'
@@ -8,6 +9,71 @@ import { ensureFreeTrialSubscription, getEffectivePlanAccess } from '../subscrip
 import { awardCredits } from '../payments/credits_service'
 import { signupBonusFor } from '../payments/credits_config'
 import jwt from 'jsonwebtoken'
+
+/** A real bcrypt hash of a random value, compared against when no account matches. */
+const TIMING_EQUALISER_HASH = '$2b$10$tH3e8THL4wq4Kb2zqHJ2ouiz8eA6FPwidbQMy89YYe29wBRSL5t4G'
+
+/**
+ * Reads the HMAC key used to hash OTPs. Deliberately read per call rather than into a
+ * module-level constant: `.env` is loaded by the side-effecting `src/lib/env` import, and
+ * ESM evaluates imports before the importing module's body, so a top-level read can observe
+ * an unset value even in a correctly configured process.
+ *
+ * Fails closed — an absent or blank secret throws rather than silently downgrading to an
+ * unkeyed digest. The message is not in the controller's client-facing allowlist, so it is
+ * logged server-side and surfaces to the caller only as a generic failure.
+ */
+function getOtpHashSecret(): string {
+    const secret = process.env.OTP_HASH_SECRET?.trim()
+    if (!secret) {
+        throw new Error('OTP_HASH_SECRET is not configured; refusing to hash OTPs without a key.')
+    }
+
+    return secret
+}
+
+/**
+ * OTPs are persisted as a keyed HMAC-SHA-256 digest, never in plaintext, so a leaked
+ * `User.otp` row cannot be replayed as-is — and, because the digest is keyed, a 6-digit code
+ * cannot be recovered by brute-forcing the small preimage space without also stealing
+ * OTP_HASH_SECRET. HMAC rather than bcrypt is deliberate: codes are single-use, expire in
+ * 10 minutes and the endpoints are rate limited, so the verify path stays cheap. The digest
+ * is 64 hex chars and the column is TEXT, so no migration is required.
+ */
+function hashOtp(otp: string): string {
+    return crypto.createHmac('sha256', getOtpHashSecret()).update(otp, 'utf8').digest('hex')
+}
+
+/** Constant-time compare of the stored OTP digest against a freshly hashed candidate. */
+function otpMatches(storedHash: string | null | undefined, otp: string): boolean {
+    if (!storedHash) return false
+
+    const stored = Buffer.from(storedHash, 'utf8')
+    const candidate = Buffer.from(hashOtp(otp), 'utf8')
+
+    // timingSafeEqual throws on differing lengths. A length mismatch only means the stored
+    // value is not a 64-char digest (e.g. a plaintext row written before hashing), which is
+    // not a match. A same-length digest made with a different key still fails the compare.
+    if (stored.length !== candidate.length) return false
+
+    return crypto.timingSafeEqual(stored, candidate)
+}
+
+/** The only environments where the console OTP fallback may run. Anything else — including
+ *  an unset or unrecognised NODE_ENV — is treated as production. */
+const DEV_OTP_FALLBACK_ENVS = new Set(['development', 'test'])
+
+/**
+ * Fail-closed gate for the console OTP fallback. It requires BOTH an explicitly
+ * non-production NODE_ENV and an explicit `EMAIL_DEV_OTP_FALLBACK=true` opt-in, so it can
+ * never activate in production no matter how EMAIL_DEV_OTP_FALLBACK is set.
+ */
+function isDevOtpFallbackAllowed(): boolean {
+    const nodeEnv = process.env.NODE_ENV?.trim().toLowerCase()
+    if (!nodeEnv || !DEV_OTP_FALLBACK_ENVS.has(nodeEnv)) return false
+
+    return process.env.EMAIL_DEV_OTP_FALLBACK === 'true'
+}
 
 
 export async function verifyUserOtp(email: string, otp: string) {
@@ -22,7 +88,7 @@ export async function verifyUserOtp(email: string, otp: string) {
         throw new Error('User is already verified')
     }
 
-    if (user.otp !== otp) {
+    if (!otpMatches(user.otp, otp)) {
         throw new Error('Invalid OTP')
     }
 
@@ -93,6 +159,8 @@ export async function registerUser(input: RegisterInput): Promise<RegisterRespon
     const hashedPassword = await bcrypt.hash(password, salt)
 
     const otp = generateOtp()
+    // Only the digest is persisted; `otp` itself stays in memory and is what gets emailed.
+    const otpHash = hashOtp(otp)
     const otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000)
 
     // 5. Create or refresh an unverified user, then send OTP.
@@ -103,7 +171,7 @@ export async function registerUser(input: RegisterInput): Promise<RegisterRespon
                 password: hashedPassword,
                 account_type,
                 is_verified: false,
-                otp,
+                otp: otpHash,
                 otp_expires_at: otpExpiresAt,
             },
             select: {
@@ -121,7 +189,7 @@ export async function registerUser(input: RegisterInput): Promise<RegisterRespon
                 password: hashedPassword,
                 account_type,
                 is_verified: false,
-                otp,
+                otp: otpHash,
                 otp_expires_at: otpExpiresAt,
             },
             select: {
@@ -137,10 +205,9 @@ export async function registerUser(input: RegisterInput): Promise<RegisterRespon
     try {
         await sendVerificationOtpEmail(email, otp)
     } catch (error) {
-        const allowDevOtpFallback = process.env.NODE_ENV !== "production" && process.env.EMAIL_DEV_OTP_FALLBACK !== "false"
-        if (!allowDevOtpFallback) throw error
+        if (!isDevOtpFallbackAllowed()) throw error
 
-        console.warn(`[DEV OTP FALLBACK] Could not send verification email to ${email}. Use OTP: ${otp}`)
+        console.warn(`[DEV-ONLY OTP FALLBACK — never runs in production] Could not send verification email to ${email}. Use OTP: ${otp}`)
     }
 
     return {
@@ -166,11 +233,11 @@ export async function login(input: LoginInput): Promise<LogEUResponse> {
             is_verified: true,
         }
     })
-    if (!user) {
-        throw new Error("user not found")
-    }
-    const isPasswordValid = await bcrypt.compare(password, user.password)
-    if (!isPasswordValid) {
+    // Unknown address and wrong password answer identically, so neither the message nor the
+    // response time reveals whether an account exists. The dummy compare keeps the timing of
+    // the two paths comparable, since skipping bcrypt entirely returns noticeably faster.
+    const isPasswordValid = await bcrypt.compare(password, user?.password ?? TIMING_EQUALISER_HASH)
+    if (!user || !isPasswordValid) {
         throw new Error("email or password is incorrect")
     }
     const accessToken = generateAccessToken(user.id)
@@ -209,12 +276,14 @@ export async function sendForgotPasswordOtp(email: string) {
     }
 
     const otp = generateOtp()
+    // Only the digest is persisted; `otp` itself stays in memory and is what gets emailed.
+    const otpHash = hashOtp(otp)
     const otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000)
 
     await prisma.user.update({
         where: { id: user.id },
         data: {
-            otp,
+            otp: otpHash,
             otp_expires_at: otpExpiresAt,
         },
     })
@@ -222,10 +291,9 @@ export async function sendForgotPasswordOtp(email: string) {
     try {
         await sendVerificationOtpEmail(normalizedEmail, otp)
     } catch (error) {
-        const allowDevOtpFallback = process.env.NODE_ENV !== "production" && process.env.EMAIL_DEV_OTP_FALLBACK !== "false"
-        if (!allowDevOtpFallback) throw error
+        if (!isDevOtpFallbackAllowed()) throw error
 
-        console.warn(`[DEV OTP FALLBACK] Could not send password reset OTP to ${normalizedEmail}. Use OTP: ${otp}`)
+        console.warn(`[DEV-ONLY OTP FALLBACK — never runs in production] Could not send password reset OTP to ${normalizedEmail}. Use OTP: ${otp}`)
     }
 
     return { message: "If this account exists, an OTP has been sent." }
@@ -239,7 +307,7 @@ export async function resetPasswordWithOtp(email: string, otp: string, password:
         throw new Error("Invalid or expired OTP")
     }
 
-    if (user.otp !== otp) {
+    if (!otpMatches(user.otp, otp)) {
         throw new Error("Invalid or expired OTP")
     }
 
@@ -265,7 +333,7 @@ export async function resetPasswordWithOtp(email: string, otp: string, password:
 export async function refreshAccessToken(refreshToken: string) {
     let payload: { sub?: string }
     try {
-        payload = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET!) as { sub?: string }
+        payload = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET!, { algorithms: ["HS256"] }) as { sub?: string }
     } catch {
         throw new Error('Invalid or expired refresh token')
     }

@@ -178,7 +178,7 @@ async function createAgentTicket(input: {
         150
     )
     const message = [
-        "[Created by PromptPulse Support Agent]",
+        "[Created by DeepMention Support Agent]",
         "",
         `Category: ${input.decision.category}`,
         `Confidence: ${input.decision.confidence}`,
@@ -280,7 +280,7 @@ function isJobStatusQuestion(message: string) {
 
 function buildAvailablePlansAnswer(context: Awaited<ReturnType<typeof buildCustomerSupportAgentContext>>) {
     return [
-        "PromptPulse uses one credit wallet for every account. Starter, Growth, and Pro are monthly credit bundles; all paid plans include the full product, and the main difference is capacity.",
+        "DeepMention uses one credit wallet for every account. Starter, Growth, and Pro are monthly credit bundles; all paid plans include the full product, and the main difference is capacity.",
         "",
         `You currently have **${context.usage.credits_remaining} credits remaining**. Starter includes 2,250 credits, Growth includes 5,000 credits with +500 bonus credits, and Pro includes 13,000 credits with +1,750 bonus credits.`,
         "",
@@ -359,7 +359,7 @@ function fallbackAnswer(message: string, category: SupportCategory, reason: stri
     }
     return message
         ? "I can help with that. If this needs account investigation, I will create a manual review ticket with the relevant context."
-        : "How can I help with your PromptPulse account?"
+        : "How can I help with your DeepMention account?"
 }
 
 function supportSubject(message: string, category: SupportCategory) {

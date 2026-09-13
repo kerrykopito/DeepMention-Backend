@@ -36,7 +36,7 @@ export function addFooter(
     doc.moveTo(42, y - 9).lineTo(width - 42, y - 9).strokeColor(C.border).lineWidth(0.5).stroke()
     doc.fillColor(C.muted).font("Helvetica").fontSize(7.5)
         .text(`Confidential - Prepared for ${pdfText(brandName)}`, 42, y, { width: 210, lineBreak: false })
-    doc.fillColor(C.faint).text("Powered by PromptPulse", width / 2 - 75, y, {
+    doc.fillColor(C.faint).text("Powered by DeepMention", width / 2 - 75, y, {
         width: 150,
         align: "center",
         lineBreak: false,

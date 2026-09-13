@@ -1,6 +1,13 @@
 import { Mistral } from '@mistralai/mistralai'
 
-const client = new Mistral({ apiKey: process.env.MISTRAL_API_KEY })
+// Built on first use so importing this module (it hangs off the route graph) stays
+// side-effect free on a serverless cold start.
+let client: Mistral | null = null
+
+function getClient() {
+    client ??= new Mistral({ apiKey: process.env.MISTRAL_API_KEY })
+    return client
+}
 
 /**
  * Runs a given prompt against Mistral's flagship chat model (mistral-large-latest)
@@ -8,7 +15,7 @@ const client = new Mistral({ apiKey: process.env.MISTRAL_API_KEY })
  * The resulting text should be passed to the Gemini analyzer to extract brand visibility data.
  */
 export async function runMistralPrompt(promptText: string): Promise<string> {
-    const chatResponse = await client.chat.complete({
+    const chatResponse = await getClient().chat.complete({
         model: 'mistral-large-latest', // The model powering Mistral's chat interface
         messages: [{ role: 'user', content: promptText }]
     })

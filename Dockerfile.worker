@@ -1,4 +1,4 @@
-FROM node:22-slim
+FROM node:22-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
 
 WORKDIR /app
 
@@ -10,7 +10,20 @@ RUN npm ci --omit=dev
 COPY prisma ./prisma
 COPY src ./src
 COPY prisma.config.ts ./
+COPY docker-entrypoint.worker.sh ./
+# Supabase CA bundle, read at runtime via DB_SSL_CA_PATH to verify the DB certificate.
+COPY certs ./certs
 
 RUN npx prisma generate
+RUN chmod +x docker-entrypoint.worker.sh
 
-CMD ["npm", "run", "brightdata:trigger"]
+# Run as the unprivileged "node" user shipped by the base image. chown the whole
+# workdir (after chmod) so tsx/node can write their caches at runtime.
+RUN chown -R node:node /app
+
+# Only the scrape worker serves this; it is harmless for the other two.
+EXPOSE 8080
+
+USER node
+
+ENTRYPOINT ["./docker-entrypoint.worker.sh"]

@@ -1,3 +1,5 @@
+import crypto from 'crypto'
+
 const BLOCKED_DOMAINS = [
   'gmail.com', 'yahoo.com', 'hotmail.com',
   'outlook.com', 'icloud.com', 'protonmail.com',
@@ -11,5 +13,5 @@ export function isWorkEmail(email: string): boolean {
 }
 
 export function generateOtp(): string {
-  return Math.floor(100000 + Math.random() * 900000).toString()
+  return crypto.randomInt(100000, 1000000).toString()
 }

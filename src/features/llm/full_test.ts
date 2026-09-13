@@ -2,7 +2,7 @@ import 'dotenv/config'
 import { researchbrand } from '../onboarding/onboarding_service'
 import { promptgeneration } from '../onboarding/onboarding_service'
 
-const BRAND_NAME = 'PromptPulse'
+const BRAND_NAME = 'DeepMention'
 const BRAND_URL = 'https://promptpulse.com/'
 
 console.log('Step 1: Researching brand with Parallel AI...')

@@ -45,8 +45,7 @@ export async function retryFailedJobsController(req: Request, res: Response): Pr
             return
         }
 
-        res.status(500).json({
-            error: error instanceof Error ? error.message : "Failed to retry scrape jobs",
-        })
+        console.error("[scrape_retry_controller:retryScrapeJobs]", error)
+        res.status(500).json({ error: "Failed to retry scrape jobs" })
     }
 }

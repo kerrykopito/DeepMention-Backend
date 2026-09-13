@@ -39,7 +39,7 @@ export async function chatCustomerSupportAgentController(req: Request, res: Resp
         const status = message === "PROJECT_NOT_FOUND" ? 404 : 500
         res.status(status).json({
             success: false,
-            error: status === 404 ? "Project not found" : message,
+            error: status === 404 ? "Project not found" : "Failed to run support agent",
         })
     }
 }

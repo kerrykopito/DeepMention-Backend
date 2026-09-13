@@ -35,8 +35,8 @@ function handleAdminError(error: unknown, res: Response, fallback: string) {
         return
     }
 
-    const message = error instanceof Error ? error.message : fallback
-    res.status(500).json({ error: message })
+    console.error("[admin_controller]", fallback, error)
+    res.status(500).json({ error: fallback })
 }
 
 export async function getAdminOverviewController(_req: Request, res: Response): Promise<void> {

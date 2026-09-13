@@ -18,6 +18,11 @@ import {
 import { handleStripeWebhook } from "./stripe_webhook_service"
 import { listBillingInvoices } from "./billing_invoice_service"
 
+function fail500(res: Response, route: string, error: unknown, fallback: string): void {
+    console.error(`[subscription_controller:${route}]`, error)
+    res.status(500).json({ error: fallback })
+}
+
 export async function createSubscriptionController(req: Request, res: Response): Promise<void> {
     try {
         const { user: { id: userId } } = req as AuthenticatedRequest
@@ -39,6 +44,10 @@ export async function createSubscriptionController(req: Request, res: Response):
             message === "User already has an active subscription" ? 409 :
             500
 
+        if (statusCode === 500) {
+            fail500(res, "createSubscription", error, "Failed to create subscription")
+            return
+        }
         res.status(statusCode).json({ error: message })
     }
 }
@@ -48,7 +57,13 @@ export async function createBillingPortalController(req: Request, res: Response)
         const { user: { id } } = req as AuthenticatedRequest
         res.json(await createBillingPortalSession(id))
     } catch (error) {
-        res.status(400).json({ error: error instanceof Error ? error.message : "Failed to open billing portal" })
+        const message = error instanceof Error ? error.message : ""
+        if (message === "No Stripe billing account found") {
+            res.status(400).json({ error: message })
+            return
+        }
+        console.error("[subscription_controller:createBillingPortal]", error)
+        res.status(400).json({ error: "Failed to open billing portal" })
     }
 }
 
@@ -58,7 +73,10 @@ export async function verifyCheckoutController(req: Request, res: Response): Pro
         const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId
         res.json(await verifyCheckoutSession(id, sessionId))
     } catch (error) {
-        res.status(404).json({ error: error instanceof Error ? error.message : "Checkout session not found" })
+        if (!(error instanceof Error && error.message === "Checkout session not found")) {
+            console.error("[subscription_controller:verifyCheckout]", error)
+        }
+        res.status(404).json({ error: "Checkout session not found" })
     }
 }
 
@@ -74,8 +92,7 @@ export async function getMyPlanController(req: Request, res: Response): Promise<
 
         res.status(200).json(plan)
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to get subscription plan"
-        res.status(500).json({ error: message })
+        fail500(res, "getMyPlan", error, "Failed to get subscription plan")
     }
 }
 
@@ -86,8 +103,7 @@ export async function getPlanLimitsController(req: Request, res: Response): Prom
 
         res.status(200).json(limits)
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to get plan limits"
-        res.status(500).json({ error: message })
+        fail500(res, "getPlanLimits", error, "Failed to get plan limits")
     }
 }
 
@@ -98,8 +114,7 @@ export async function getPlanQuotaController(req: Request, res: Response): Promi
 
         res.status(200).json(quota)
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to get plan quota"
-        res.status(500).json({ error: message })
+        fail500(res, "getPlanQuota", error, "Failed to get plan quota")
     }
 }
 
@@ -115,7 +130,10 @@ export async function stripeWebhookController(req: Request, res: Response): Prom
     } catch (error) {
         const message = error instanceof Error ? error.message : "Failed to handle Stripe webhook"
         const isSignatureError = message.includes("signature") || message.includes("STRIPE_WEBHOOK_SECRET")
-        res.status(isSignatureError ? 400 : 500).json({ error: message })
+        console.error("[subscription_controller:stripeWebhook]", error)
+        res.status(isSignatureError ? 400 : 500).json({
+            error: isSignatureError ? "Invalid webhook signature" : "Failed to handle Stripe webhook",
+        })
     }
 }
 
@@ -126,8 +144,7 @@ export async function canCreateProjectController(req: Request, res: Response): P
 
         res.status(200).json(result)
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to check project limit"
-        res.status(500).json({ error: message })
+        fail500(res, "canCreateProject", error, "Failed to check project limit")
     }
 }
 
@@ -138,8 +155,7 @@ export async function canCreatePromptController(req: Request, res: Response): Pr
 
         res.status(200).json(result)
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to check prompt limit"
-        res.status(500).json({ error: message })
+        fail500(res, "canCreatePrompt", error, "Failed to check prompt limit")
     }
 }
 
@@ -150,8 +166,7 @@ export async function canAddCompetitorController(req: Request, res: Response): P
 
         res.status(200).json(result)
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to check competitor limit"
-        res.status(500).json({ error: message })
+        fail500(res, "canAddCompetitor", error, "Failed to check competitor limit")
     }
 }
 
@@ -162,8 +177,7 @@ export async function canRunRefreshController(req: Request, res: Response): Prom
 
         res.status(200).json(result)
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to check refresh limit"
-        res.status(500).json({ error: message })
+        fail500(res, "canRunRefresh", error, "Failed to check refresh limit")
     }
 }
 
@@ -174,8 +188,7 @@ export async function canExportController(req: Request, res: Response): Promise<
 
         res.status(200).json(result)
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to check export access"
-        res.status(500).json({ error: message })
+        fail500(res, "canExport", error, "Failed to check export access")
     }
 }
 
@@ -186,7 +199,6 @@ export async function refreshPlanUsageController(req: Request, res: Response): P
 
         res.status(200).json(usage)
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to refresh plan usage"
-        res.status(500).json({ error: message })
+        fail500(res, "refreshPlanUsage", error, "Failed to refresh plan usage")
     }
 }

@@ -1,6 +1,7 @@
 import { NextFunction, Request, Response } from "express"
 import jwt from "jsonwebtoken"
 import prisma from "../lib/prisma"
+import { readAccessTokenCookie } from "../utils/auth_cookies"
 
 export type AuthenticatedRequest = Request & {
     user: {
@@ -15,18 +16,39 @@ type AccessTokenPayload = {
 }
 
 export async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
+    // The Authorization header stays the primary source, so every existing client — and any
+    // non-browser caller — is unaffected. The httpOnly `access_token` cookie is accepted as a
+    // second source, including when a bearer token was sent but did not verify.
     const header = req.headers.authorization
+    const bearerToken = header?.startsWith("Bearer ") ? header.slice("Bearer ".length).trim() : ""
+    const cookieToken = readAccessTokenCookie(req)
 
-    if (!header?.startsWith("Bearer ")) {
+    // Both sources are tried, header first. Taking only the header when one is present would
+    // let a STALE bearer token mask a perfectly valid cookie: browsers that logged in before
+    // the cookie migration still had an expired token in localStorage, sent it on every
+    // request, and got a 401 despite holding a fresh cookie — which bounced them to /login
+    // immediately after a successful login.
+    const candidates = [bearerToken, cookieToken].filter((value): value is string => Boolean(value))
+
+    if (candidates.length === 0) {
         res.status(401).json({ error: "Missing authorization token" })
         return
     }
 
     try {
-        const token = header.slice("Bearer ".length).trim()
-        const payload = jwt.verify(token, process.env.JWT_ACCESS_SECRET!) as AccessTokenPayload
+        let payload: AccessTokenPayload | null = null
+        for (const candidate of candidates) {
+            try {
+                payload = jwt.verify(candidate, process.env.JWT_ACCESS_SECRET!, { algorithms: ["HS256"] }) as AccessTokenPayload
+                if (payload?.sub) break
+                payload = null
+            } catch {
+                // Try the next source; only fail once every candidate has been rejected.
+                payload = null
+            }
+        }
 
-        if (!payload.sub) {
+        if (!payload?.sub) {
             res.status(401).json({ error: "Invalid authorization token" })
             return
         }

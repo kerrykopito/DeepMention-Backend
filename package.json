@@ -9,6 +9,8 @@
     "dev": "tsx server.ts",
     "worker:scrape": "tsx src/workers/scrape_worker.ts",
     "worker:sources": "tsx src/workers/source_enrichment_worker.ts",
+    "workers:all": "concurrently -n scrape,sources,weekly -c cyan,magenta,yellow \"npm:worker:scrape\" \"npm:worker:sources\" \"npm:scheduler:weekly-email\"",
+    "dev:all": "concurrently -n api,scrape,sources,weekly -c green,cyan,magenta,yellow \"npm:dev\" \"npm:worker:scrape\" \"npm:worker:sources\" \"npm:scheduler:weekly-email\"",
     "brightdata:daily": "tsx src/scripts/brightdata_create_daily_batches.ts",
     "brightdata:trigger": "tsx src/scripts/brightdata_trigger_batches.ts",
     "brightdata:poll": "tsx src/scripts/brightdata_poll_batches.ts",
@@ -42,7 +44,8 @@
     "whatsapp:migrate-tokens": "tsx src/scripts/migrate_whatsapp_tokens.ts",
     "test:whatsapp:unit": "tsx --test src/features/campaigns/whatsapp/whatsapp.test.ts",
     "test:whatsapp:e2e": "tsx src/scripts/test_whatsapp_e2e.ts",
-    "backfill:forum-sources": "tsx src/scripts/backfill_forum_sources.ts"
+    "backfill:forum-sources": "tsx src/scripts/backfill_forum_sources.ts",
+    "postinstall": "prisma generate"
   },
   "author": "",
   "license": "ISC",
@@ -62,6 +65,7 @@
     "dotenv": "^17.4.2",
     "exceljs": "^4.4.0",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.7.0",
     "helmet": "^8.2.0",
     "ioredis": "^5.11.1",
     "jsdom": "^29.1.1",
@@ -85,6 +89,7 @@
     "@types/node": "^26.0.1",
     "@types/node-cron": "^3.0.11",
     "@types/pdfkit": "^0.17.6",
+    "concurrently": "^10.0.5",
     "typescript": "^6.0.3"
   }
 }

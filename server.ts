@@ -34,7 +34,11 @@ import emailCampaignRoutes from './src/features/campaigns/email/email_routes'
 import { stripeWebhookController } from './src/features/subscription/subscription_controller'
 import { requireAdmin, requireAuth } from './src/middleware/auth'
 
-if (process.env.ENABLE_DAILY_SCRAPE_SCHEDULER === "true") {
+// The scheduler registers a node-cron timer and a BullMQ queue at import time. In a
+// serverless function that timer never fires but does keep the invocation alive, so the
+// function hangs on cold start — skip it on Vercel even if the env var is inherited from
+// the Cloud Run config. `npm run scheduler:daily` still runs it as its own process.
+if (!process.env.VERCEL && process.env.ENABLE_DAILY_SCRAPE_SCHEDULER === "true") {
     void import("./src/scheduler/daily_scheduler")
 }
 
@@ -49,10 +53,42 @@ process.on("unhandledRejection", reason => {
 const app = express()
 const PORT = process.env.PORT || 3000
 
+// One hop (Cloud Run / a single load balancer). Rate limiting reads req.ip, which is the
+// proxy's address unless this is set — and trusting every hop would let clients spoof it.
+app.set("trust proxy", 1)
+
 app.use(helmet({
     crossOriginResourcePolicy: { policy: "cross-origin" },
 }))
-app.use(cors())
+// SECURITY: this was `cors()`, which reflected EVERY origin — any website could drive this
+// API from a logged-in victim's browser. Restrict to the known frontends. Extra origins
+// (preview deployments, a new domain) can be added via CORS_ALLOWED_ORIGINS as a
+// comma-separated list; they are added to, never replace, these defaults.
+const DEFAULT_ALLOWED_ORIGINS = [
+    "https://deepmention.xyz",
+    "https://www.deepmention.xyz",
+    "https://app.deepmention.xyz",
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
+const allowedOrigins = new Set([
+    ...DEFAULT_ALLOWED_ORIGINS,
+    ...(process.env.CORS_ALLOWED_ORIGINS?.split(",").map(origin => origin.trim()).filter(Boolean) ?? []),
+])
+app.use(cors({
+    origin: (origin, callback) => {
+        // No Origin header => not a browser cross-origin request (curl, health checks,
+        // server-to-server). Those are unaffected by CORS, so allow them through.
+        if (!origin || allowedOrigins.has(origin)) {
+            callback(null, true)
+            return
+        }
+        // Deny by omitting CORS headers rather than throwing, so a blocked origin gets a
+        // clean browser-side CORS failure instead of a 500 from the error handler.
+        callback(null, false)
+    },
+    credentials: true,
+}))
 app.get('/health', (_req, res) => {
     res.status(200).json({ ok: true })
 })
@@ -105,6 +141,13 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
     res.status(500).json({ success: false, message: 'Internal server error' })
 })
 
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`)
-})
+// On Vercel the app runs as a serverless function (see api/index.ts), which imports this
+// module and uses the exported `app` — it must NOT call listen() there. Locally / on
+// Cloud Run we still start a normal HTTP server.
+if (!process.env.VERCEL) {
+    app.listen(PORT, () => {
+        console.log(`Server running on port ${PORT}`)
+    })
+}
+
+export default app

@@ -2,8 +2,48 @@ import axios from "axios"
 import https from "https"
 import { SourceType } from "@prisma/client"
 import prisma from "../../lib/prisma"
-import { JSDOM } from "jsdom"
-import { Readability } from "@mozilla/readability"
+import { assertPublicUrl, BlockedUrlError } from "../../lib/safe_url"
+
+const MAX_REDIRECT_HOPS = 5
+
+// SECURITY: Guard every outbound hop against SSRF. Source URLs are fetched
+// server-side, so a URL that resolves to (or 30x-redirects to) a private/
+// link-local/cloud-metadata address must be blocked. axios' own redirect
+// following would skip the check on all but the first address, so redirects are
+// followed by hand and each target is re-validated with assertPublicUrl — the
+// same approach the onboarding brand crawler uses.
+async function fetchHtmlWithSsrfGuard(url: string): Promise<string> {
+    const requestConfig = {
+        timeout: Number(process.env.SOURCE_FETCH_TIMEOUT_MS ?? 20000),
+        responseType: "text" as const,
+        maxRedirects: 0,
+        headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-IN,en;q=0.9"
+        },
+        httpsAgent: process.env.NODE_ENV !== "production"
+            ? new https.Agent({ rejectUnauthorized: false })
+            : undefined,
+        validateStatus: (status: number) => status >= 200 && status < 400
+    }
+
+    let currentUrl = url
+    for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
+        const safeUrl = await assertPublicUrl(currentUrl)
+        const response = await axios.get<string>(safeUrl.toString(), requestConfig)
+
+        const location = response.headers?.location
+        if (response.status >= 300 && response.status < 400 && typeof location === "string") {
+            currentUrl = new URL(location, safeUrl).toString()
+            continue
+        }
+
+        return typeof response.data === "string" ? response.data : String(response.data)
+    }
+
+    throw new BlockedUrlError("Source URL redirected too many times.")
+}
 
 type SourceUrlTypeValue =
     | "LISTICLE"
@@ -91,25 +131,16 @@ export async function fetchAndExtractSource(url: string, brands: string[]): Prom
     const base = classifyUrl(normalizedUrl, domain)
 
     try {
-        const response = await axios.get<string>(normalizedUrl, {
-            timeout: Number(process.env.SOURCE_FETCH_TIMEOUT_MS ?? 20000),
-            responseType: "text",
-            maxRedirects: 5,
-            headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-IN,en;q=0.9"
-            },
-            httpsAgent: process.env.NODE_ENV !== "production"
-                ? new https.Agent({ rejectUnauthorized: false })
-                : undefined
-        })
-
-        const html = typeof response.data === "string" ? response.data : String(response.data)
+        const html = await fetchHtmlWithSsrfGuard(normalizedUrl)
         const title = extractTitle(html)
         
         let extractedHtml = html
         try {
+            // jsdom costs ~0.6s to load and is only needed when a source is actually
+            // enriched, so it is pulled in here instead of at module scope — this module
+            // hangs off /api/sources and would otherwise pay that on every cold start.
+            const { JSDOM } = await import("jsdom")
+            const { Readability } = await import("@mozilla/readability")
             const doc = new JSDOM(html, { url: normalizedUrl })
             const reader = new Readability(doc.window.document)
             const article = reader.parse()

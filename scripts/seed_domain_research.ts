@@ -1,13 +1,15 @@
 import "dotenv/config"
 import prisma from "../src/lib/prisma"
 
+const TARGET_EMAIL = process.env.DEMO_SEED_EMAIL ?? "pedro@team-nexio.com"
+
 async function main() {
     const user = await prisma.user.findUnique({
-        where: { email: "vamsi.krishna@refractone.com" }
+        where: { email: TARGET_EMAIL }
     })
 
     if (!user) {
-        console.error("User vamsi.krishna@refractone.com not found!")
+        console.error(`User ${TARGET_EMAIL} not found!`)
         process.exit(1)
     }
 
@@ -20,7 +22,7 @@ async function main() {
         process.exit(1)
     }
 
-    const domain = "refractone.com"
+    const domain = process.env.DEMO_SEED_DOMAIN ?? "team-nexio.com"
     const locationCode = 2840
     const languageCode = "en"
     const countryIsoCode = "US"

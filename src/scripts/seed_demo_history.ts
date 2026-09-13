@@ -1,8 +1,9 @@
+import "../lib/env"
 import "dotenv/config"
 import prisma from "../lib/prisma"
 
 const DEMO_TAG = "DEMO_15D_SEED"
-const TARGET_EMAIL = process.env.DEMO_SEED_EMAIL ?? "vamsi.krishna@refractconsulting.com"
+const TARGET_EMAIL = process.env.DEMO_SEED_EMAIL ?? "pedro@team-nexio.com"
 
 const engines = ["CHATGPT", "GEMINI", "PERPLEXITY"] as const
 
@@ -66,9 +67,9 @@ const sourcePool = [
     url_type: "HOMEPAGE",
   },
   {
-    domain: "refractconsulting.com",
-    url: "https://refractconsulting.com/",
-    title: "Refract Consulting",
+    domain: "team-nexio.com",
+    url: "https://team-nexio.com/",
+    title: "Team Nexio",
     source_type: "YOU",
     url_type: "HOMEPAGE",
   },

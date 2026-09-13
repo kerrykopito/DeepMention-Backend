@@ -1,4 +1,5 @@
 import "../lib/env"
+import express from "express"
 import { Worker } from "bullmq"
 import { getRedisConnectionOptions } from "../lib/redis"
 import prisma from "../lib/prisma"
@@ -23,6 +24,25 @@ worker.on("completed", job => {
 worker.on("failed", (job, error) => {
     console.error(`Source enrichment failed: ${job?.id}`, error)
 })
+
+// Cloud Run kills a container that never binds a port, so the worker only deploys as a
+// service if it answers health checks. Locally PORT is unset and no server is started.
+if (process.env.PORT) {
+    const app = express()
+    const port = Number(process.env.PORT)
+
+    app.get("/", (_req, res) => {
+        res.json({ service: "source-enrichment-worker", status: "ok", queue: SOURCE_ENRICHMENT_QUEUE_NAME })
+    })
+
+    app.get("/health", (_req, res) => {
+        res.json({ status: "ok", queue: SOURCE_ENRICHMENT_QUEUE_NAME, worker_running: worker.isRunning() })
+    })
+
+    app.listen(port, "0.0.0.0", () => {
+        console.log(`Source enrichment worker health server listening on :${port}`)
+    })
+}
 
 process.on("SIGINT", async () => {
     await worker.close()

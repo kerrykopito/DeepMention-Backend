@@ -1,6 +1,30 @@
 import { Request, Response } from 'express'
 import { z } from 'zod'
 import { refreshAccessToken, registerUser, resetPasswordWithOtp, sendForgotPasswordOtp, verifyUserOtp, login as loginService } from './auth_service'
+import { clearAuthCookies, readRefreshTokenCookie, setAuthCookies } from '../../utils/auth_cookies'
+
+/** Messages auth_service throws deliberately for the client. Anything else is internal. */
+const EXPECTED_AUTH_ERRORS = new Set([
+    'User not found',
+    'User is already verified',
+    'Invalid OTP',
+    'OTP has expired',
+    'Only work/business email addresses are allowed.',
+    'An account with this email already exists.',
+    'email or password is incorrect',
+    'please verify your email',
+    'Invalid or expired OTP',
+    'Invalid or expired refresh token',
+    'Invalid refresh token',
+    'Invalid refresh user',
+])
+
+function clientMessage(err: unknown, route: string, fallback: string): string {
+    const message = err instanceof Error ? err.message : ''
+    if (EXPECTED_AUTH_ERRORS.has(message)) return message
+    console.error(`[auth_controller:${route}]`, err)
+    return fallback
+}
 
 const registerSchema = z.object({
     email: z.string().email('Invalid email format'),
@@ -36,6 +60,11 @@ export async function register(req: Request, res: Response): Promise<void> {
                 : message.includes('work/business') ? 422
                     : isEmailDeliveryError ? 502
                     : 500
+        if (status === 500) {
+            console.error('[auth_controller:register]', err)
+            res.status(500).json({ success: false, message: 'Registration failed. Please try again.' })
+            return
+        }
         res.status(status).json({
             success: false,
             message: isEmailDeliveryError
@@ -63,10 +92,10 @@ export async function verifyOtp(req: Request, res: Response): Promise<void> {
 
     try {
         const result = await verifyUserOtp(parsed.data.email, parsed.data.otp)
+        setAuthCookies(res, result)
         res.status(200).json({ success: true, ...result })
     } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : 'Verification failed'
-        res.status(400).json({ success: false, message })
+        res.status(400).json({ success: false, message: clientMessage(err, 'verifyOtp', 'Verification failed') })
     }
 }
 
@@ -100,6 +129,7 @@ export async function login(req: Request, res: Response): Promise<void> {
     }
     try {
         const result = await loginService(parsed.data)
+        setAuthCookies(res, result)
         res.status(200).json({ success: true, ...result })
     } catch (err: unknown) {
         const message = err instanceof Error ? err.message : 'Login failed'
@@ -111,7 +141,7 @@ export async function login(req: Request, res: Response): Promise<void> {
             res.status(403).json({ success: false, message: 'Please verify your email using the verification code sent to your inbox before logging in.' })
             return
         }
-        res.status(401).json({ success: false, message })
+        res.status(401).json({ success: false, message: clientMessage(err, 'login', 'Login failed') })
     }
 }
 
@@ -131,11 +161,12 @@ export async function forgotPasswordSendOtp(req: Request, res: Response): Promis
     } catch (err: unknown) {
         const message = err instanceof Error ? err.message : 'Failed to send password reset OTP'
         const isEmailDeliveryError = message.includes('Brevo email send failed')
+        if (!isEmailDeliveryError) console.error('[auth_controller:forgotPasswordSendOtp]', err)
         res.status(isEmailDeliveryError ? 502 : 500).json({
             success: false,
             message: isEmailDeliveryError
                 ? "We could not send your password reset code right now. Please try again in a moment."
-                : message,
+                : 'Failed to send password reset code. Please try again.',
         })
     }
 }
@@ -154,8 +185,7 @@ export async function forgotPasswordReset(req: Request, res: Response): Promise<
         const result = await resetPasswordWithOtp(parsed.data.email, parsed.data.otp, parsed.data.password)
         res.status(200).json({ success: true, ...result })
     } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : 'Failed to reset password'
-        res.status(400).json({ success: false, message })
+        res.status(400).json({ success: false, message: clientMessage(err, 'forgotPasswordReset', 'Failed to reset password') })
     }
 }
 
@@ -164,16 +194,33 @@ const refreshSchema = z.object({
 })
 
 export async function refresh(req: Request, res: Response): Promise<void> {
+    // The body stays the primary source. A cookie-only client sends no body at all, so the
+    // schema has to be allowed to fail before the cookie is consulted — hence the resolve-then-
+    // validate order rather than an early return on a failed parse.
     const parsed = refreshSchema.safeParse(req.body)
-    if (!parsed.success) {
+    const refreshToken = parsed.success ? parsed.data.refresh_token : readRefreshTokenCookie(req)
+
+    if (!refreshToken) {
         res.status(401).json({ success: false, message: 'Refresh token is required' })
         return
     }
 
     try {
-        res.status(200).json({ success: true, ...await refreshAccessToken(parsed.data.refresh_token) })
+        const tokens = await refreshAccessToken(refreshToken)
+        setAuthCookies(res, tokens)
+        res.status(200).json({ success: true, ...tokens })
     } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : 'Session expired'
-        res.status(401).json({ success: false, message })
+        // Deliberately does NOT clear the cookies: a transient database failure surfaces here
+        // too, and dropping the session over one would log the user out for no reason.
+        res.status(401).json({ success: false, message: clientMessage(err, 'refresh', 'Session expired') })
     }
+}
+
+/**
+ * Clears the auth cookies. Intentionally unauthenticated and always 200 — logging out must
+ * succeed even when the access token has already expired.
+ */
+export async function logout(_req: Request, res: Response): Promise<void> {
+    clearAuthCookies(res)
+    res.status(200).json({ success: true, message: 'Logged out' })
 }

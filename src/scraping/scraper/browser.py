@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -22,13 +23,32 @@ COMMON_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--disable-infobars",
     "--disable-dev-shm-usage",
+    # SECURITY: --no-sandbox disables Chromium's renderer sandbox while it loads untrusted
+    # third-party pages, so a renderer exploit reaches host code. It is kept because Chromium
+    # will not launch as root inside the container without it; the compensating control is
+    # that the scrape API now requires an auth token (see chatgpt_scraper.require_api_token).
+    # If this runs as a non-root user (locally or via a container USER), remove this flag.
     "--no-sandbox",
 ]
 
 
+# SECURITY: profile names become a Chromium `user_data_dir` on disk. Restrict them to a
+# strict allow-list and confine the resolved path to PROFILE_DIR so an attacker-supplied
+# `profile` (e.g. "../../etc") cannot escape the profile directory (path traversal).
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
 def profile_path(profile_name: str) -> Path:
     ensure_dirs()
-    return PROFILE_DIR / profile_name
+    if not isinstance(profile_name, str) or not _PROFILE_NAME_RE.match(profile_name):
+        raise ValueError(
+            "Invalid profile name: must match ^[A-Za-z0-9_-]{1,64}$"
+        )
+    base = PROFILE_DIR.resolve()
+    candidate = (base / profile_name).resolve()
+    if candidate != base and base not in candidate.parents:
+        raise ValueError("Profile path escapes the profile directory")
+    return candidate
 
 
 @asynccontextmanager

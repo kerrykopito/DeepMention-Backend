@@ -3,6 +3,7 @@ import prisma from "../../lib/prisma"
 import { processFailedInvoice, processPaidInvoice, getInvoiceSubscriptionId } from "./billing_invoice_service"
 import { getStripeClient, getStripeId } from "./stripe_config"
 import { syncSubscriptionFromStripe } from "./subscription_service"
+import { awardCreditPackFromCheckoutSession } from "../payments/credits_service"
 
 async function beginEvent(event: Stripe.Event) {
     const existing = await prisma.stripeWebhookEvent.findUnique({ where: { stripe_event_id: event.id } })
@@ -31,6 +32,10 @@ async function processEvent(event: Stripe.Event) {
     const stripe = getStripeClient()
     if (event.type === "checkout.session.completed") {
         const session = event.data.object as Stripe.Checkout.Session
+        if (session.mode === "payment") {
+            await awardCreditPackFromCheckoutSession(session)
+            return
+        }
         const subscriptionId = getStripeId(session.subscription)
         if (subscriptionId) await syncSubscriptionFromStripe(await stripe.subscriptions.retrieve(subscriptionId))
         return

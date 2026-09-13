@@ -41,7 +41,7 @@ export function renderOverviewCover(doc: PDFKit.PDFDocument, model: OverviewExpo
     doc.fillColor(C.white).font("Helvetica-Bold").fontSize(27)
         .text(`${(visibility?.value ?? 0).toFixed(1)}%`, 48, height - 62)
     doc.fillColor("#9CB6D0").font("Helvetica").fontSize(8)
-        .text("Powered by PromptPulse", width - 180, height - 31, { width: 132, align: "right" })
+        .text("Powered by DeepMention", width - 180, height - 31, { width: 132, align: "right" })
 }
 
 function drawInitial(doc: PDFKit.PDFDocument, brandName: string) {

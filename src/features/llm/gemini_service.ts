@@ -1,4 +1,4 @@
-import { GoogleGenerativeAI } from '@google/generative-ai'
+import { GoogleGenerativeAI, type GenerativeModel } from '@google/generative-ai'
 import axios from 'axios'
 import https from 'https'
 import { buildBrandPromptGenerationSystemPrompt, buildBrandPromptGenerationUserPrompt } from '../../prompts/brand_prompts'
@@ -9,12 +9,31 @@ import { isEligibleCompetitorEntity, normalizeEntityDomain, sanitizeDiscoveredBr
 import { normalizeStrictBrandName } from '../brands/strict_brand_matcher'
 import { analyzeUiAnswerWithKimi } from './analysis/kimi_analysis_service'
 
-const genai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!)
-const model = genai.getGenerativeModel({ model: 'gemini-3.1-flash-lite' })
-const embeddingModel = genai.getGenerativeModel({
-    model: process.env.GEMINI_EMBEDDING_MODEL ?? 'gemini-embedding-001'
-})
-const GROQ_ANALYSIS_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct'
+// Built on first use, not at import: this module is pulled in by the route graph, and on a
+// serverless cold start nothing should be constructed until a request actually needs it.
+let genai: GoogleGenerativeAI | null = null
+let model: GenerativeModel | null = null
+
+function getModel() {
+    if (model) return model
+    genai ??= new GoogleGenerativeAI(process.env.GEMINI_API_KEY!)
+    model = genai.getGenerativeModel({ model: 'gemini-3.1-flash-lite' })
+    return model
+}
+
+const GROQ_ANALYSIS_MODEL = 'qwen/qwen3.8-27b'
+
+// Analysis runs on Gemini (then Groq) when no Bedrock credential is present. Logged once per
+// process rather than per analysed answer, which would be thousands of lines in a scrape run.
+let bedrockFallbackWarned = false
+function warnBedrockFallbackOnce() {
+    if (bedrockFallbackWarned) return
+    bedrockFallbackWarned = true
+    console.warn(
+        'Bedrock gateway not configured; analysing with Gemini instead of Kimi. '
+        + 'Set KIMI_ANALYSIS_REQUIRED=true to treat this as a fatal error instead.'
+    )
+}
 
 export async function embedText(text: string): Promise<number[]> {
     const cleanText = text.replace(/\s+/g, ' ').trim()
@@ -44,7 +63,7 @@ export async function generateTextStream(
     onChunk: (chunk: string) => void
 ): Promise<string> {
     try {
-        const result = await model.generateContentStream([
+        const result = await getModel().generateContentStream([
             { text: systemPrompt },
             { text: userPrompt },
         ])
@@ -82,7 +101,7 @@ export async function generateBrandPrompts(
     const userPrompt = buildBrandPromptGenerationUserPrompt(brand_name, brand_url, brand_data)
 
     try {
-        const result = await model.generateContent([
+        const result = await getModel().generateContent([
             { text: systemPrompt },
             { text: userPrompt },
         ])
@@ -117,7 +136,7 @@ export async function summarizeBrandResearch(
     }
 
     try {
-        const result = await model.generateContent([
+        const result = await getModel().generateContent([
             { text: systemPrompt },
             { text: userPrompt },
         ])
@@ -150,20 +169,16 @@ export async function analyzeResponse(
         return { ...normalizeAnalysisResult(parsed, raw_response, brand_name, brand_url, citations), ai_model }
     }
 
-    if (
-        process.env.NODE_ENV === "production"
-        || process.env.KIMI_ANALYSIS_REQUIRED?.trim().toLowerCase() === "true"
-    ) {
+    if (process.env.KIMI_ANALYSIS_REQUIRED?.trim().toLowerCase() === "true") {
         throw new Error(
             "Kimi analysis is required but the Bedrock gateway is not configured. "
             + "Configure a supported Bedrock gateway credential on this runtime."
         )
     }
 
-    // Local development may still use the legacy providers when explicitly run
-    // without Bedrock credentials. Production never silently bypasses Kimi.
+    warnBedrockFallbackOnce()
     try {
-        const result = await model.generateContent({
+        const result = await getModel().generateContent({
             contents: [{ role: 'user', parts: [{ text: systemPrompt }, { text: userPrompt }] }],
             generationConfig: { maxOutputTokens: 8192 }
         })
@@ -619,7 +634,7 @@ const KNOWN_BRANDS: KnownBrand[] = [
     { name: "SE Ranking", domain: "seranking.com", aliases: ["SERanking", "SE Visible"] },
     { name: "Brand24", domain: "brand24.com" },
     { name: "PromptWatch", domain: "promptwatch.com" },
-    { name: "PromptPulse", domain: "promptpulse.online", aliases: ["Prompt Pulse"] },
+    { name: "DeepMention", domain: "deepmention.xyz", aliases: ["Deep Mention"] },
     { name: "Evertune", domain: "evertune.ai" },
     { name: "LLMClicks", domain: "llmclicks.ai", aliases: ["LLM Clicks"] },
     { name: "Pranas", domain: "pranas.co" },

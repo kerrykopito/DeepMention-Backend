@@ -1,3 +1,4 @@
+import "../lib/env"
 import "dotenv/config"
 import prisma from "../lib/prisma"
 import { normalizeAnswerBlocks } from "../features/dashboard/answer_block_normalizer"

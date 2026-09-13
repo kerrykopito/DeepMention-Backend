@@ -1,13 +1,55 @@
+# Builds one worker image and deploys the scrape worker from it.
+#
+# The same image serves the source-enrichment worker and the weekly email job -
+# WORKER_KIND selects which process runs. See README.md at the project root for
+# why those two are not deployed here yet.
+#
+#   gcloud builds submit --config cloudbuild.worker.yaml .
+
+substitutions:
+  _REGION: us-east1
+  _REPO: agents
+  _SERVICE: promptpulse-scrape-worker
+
 steps:
   - name: gcr.io/cloud-builders/docker
+    id: build
     args:
       - build
       - -f
       - Dockerfile.worker
       - -t
-      - us-east1-docker.pkg.dev/$PROJECT_ID/agents/promptpulse-worker:latest
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/promptpulse-worker:$COMMIT_SHA
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/promptpulse-worker:latest
       - .
+
+  - name: gcr.io/cloud-builders/docker
+    id: push
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/promptpulse-worker
+
+  # min-instances=1 keeps the queue consumer alive; Cloud Run would otherwise
+  # scale it to zero and jobs would sit unconsumed in Redis.
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: deploy-scrape
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/promptpulse-worker:$COMMIT_SHA
+      - --region=${_REGION}
+      - --platform=managed
+      - --no-allow-unauthenticated
+      - --min-instances=1
+      - --max-instances=1
+      - --set-env-vars=WORKER_KIND=scrape
+
 images:
-  - us-east1-docker.pkg.dev/$PROJECT_ID/agents/promptpulse-worker:latest
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/promptpulse-worker:latest
+
 options:
   logging: CLOUD_LOGGING_ONLY

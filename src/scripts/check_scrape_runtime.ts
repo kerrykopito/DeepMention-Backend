@@ -1,3 +1,4 @@
+import "../lib/env"
 import "dotenv/config"
 import { Queue } from "bullmq"
 import prisma from "../lib/prisma"

@@ -26,7 +26,7 @@ export async function persistStripeInvoice(invoice: Stripe.Invoice) {
         })
         : null
 
-    if (!localSubscription) throw new Error(`No PromptPulse subscription found for Stripe invoice ${invoice.id}`)
+    if (!localSubscription) throw new Error(`No DeepMention subscription found for Stripe invoice ${invoice.id}`)
 
     const record = await prisma.billingInvoice.upsert({
         where: { stripe_invoice_id: invoice.id },

@@ -125,7 +125,7 @@ export async function getPromptsWithStats(input: GetPromptsInput) {
             observed_demand_score: observedDemand.get(prompt.id)?.score ?? null,
             observed_demand_label: observedDemand.get(prompt.id)?.label ?? "NOT_ENOUGH_DATA",
             observed_runs_30d: observedDemand.get(prompt.id)?.runs_30d ?? 0,
-            observed_demand_basis: "PromptPulse AI runs in the last 30 days",
+            observed_demand_basis: "DeepMention AI runs in the last 30 days",
             last_run_at: prompt.last_run_at,
             created_at: prompt.created_at,
             // stats

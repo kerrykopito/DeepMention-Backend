@@ -1,6 +1,6 @@
 import type { Request, Response } from "express"
 import type { AuthenticatedRequest } from "../../middleware/auth"
-import { getCreditBalance, getCreditTransactions, isLowBalance, getBillingAudience, grantDueAnnualSubscriptionCreditsForUser } from "./credits_service"
+import { getCreditBalance, getCreditTransactions, isLowBalance, getBillingAudience, grantDueAnnualSubscriptionCreditsForUser, createCreditPackCheckoutSession } from "./credits_service"
 import { AGENCY_CREDIT_PACKS, CREDIT_PACKS } from "./credits_config"
 import { publicBillingCatalog } from "./billing_catalog"
 
@@ -28,6 +28,28 @@ export async function getBillingCatalogController(req: Request, res: Response): 
     const { user: { id: userId } } = req as AuthenticatedRequest
     const audience = await getBillingAudience(userId)
     res.json(publicBillingCatalog(audience))
+}
+
+/** POST /api/payments/packs/checkout */
+export async function createCreditPackCheckoutController(req: Request, res: Response): Promise<void> {
+    try {
+        const { user: { id: userId } } = req as AuthenticatedRequest
+        const { pack_id, custom_credits, request_id } = req.body as { pack_id?: string; custom_credits?: number; request_id?: string }
+        const checkout = await createCreditPackCheckoutSession(userId, { pack_id, custom_credits }, request_id)
+        res.status(201).json(checkout)
+    } catch (error) {
+        const message = error instanceof Error ? error.message : "Failed to create checkout session"
+        const statusCode =
+            message === "Invalid credit pack" ? 400 :
+            message === "User not found" ? 404 :
+            500
+        if (statusCode === 500) {
+            console.error("[payments_controller:createCreditPackCheckout]", error)
+            res.status(500).json({ error: "Failed to create checkout session" })
+            return
+        }
+        res.status(statusCode).json({ error: message })
+    }
 }
 
 /** GET /api/payments/transactions */

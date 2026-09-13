@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+node_modules
+src/scraping/venv
+src/scraping/browser_profiles
+src/scraping/results
+tmp
+scratch

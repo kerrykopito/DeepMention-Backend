@@ -1,3 +1,4 @@
+import "../lib/env"
 import "dotenv/config"
 import prisma from "../lib/prisma"
 const KEEP_TABLES = new Set(["User", "_prisma_migrations"])

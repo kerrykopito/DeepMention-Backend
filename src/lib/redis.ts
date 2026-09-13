@@ -3,8 +3,10 @@ import Redis from "ioredis"
 function getRedisTlsOptions(enabled: boolean) {
     if (!enabled) return undefined
 
+    // Verify by default: an unverified TLS connection is encrypted but impersonatable, and
+    // job payloads carry customer data. Opt out only for a self-signed cert in local dev.
     return {
-        rejectUnauthorized: process.env.REDIS_TLS_REJECT_UNAUTHORIZED === "true"
+        rejectUnauthorized: process.env.REDIS_TLS_REJECT_UNAUTHORIZED !== "false"
     }
 }
 

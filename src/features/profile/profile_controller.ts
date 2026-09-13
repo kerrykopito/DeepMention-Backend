@@ -11,8 +11,11 @@ export async function getProfileController(req: Request, res: Response): Promise
         const profile = await getProfileData(userId)
         res.status(200).json(profile)
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to get profile"
-        const statusCode = message === "User not found" ? 404 : 500
-        res.status(statusCode).json({ error: message })
+        if (error instanceof Error && error.message === "User not found") {
+            res.status(404).json({ error: error.message })
+            return
+        }
+        console.error("[profile_controller:getProfile]", error)
+        res.status(500).json({ error: "Failed to get profile" })
     }
 }

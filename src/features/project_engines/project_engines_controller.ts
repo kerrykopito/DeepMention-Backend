@@ -24,8 +24,8 @@ export async function getProjectEnginesController(req: Request, res: Response): 
             res.status(404).json({ error: "Project not found" })
             return
         }
-        const message = error instanceof Error ? error.message : "Failed to load AI engines"
-        res.status(500).json({ error: message })
+        console.error("[project_engines_controller:load]", error)
+        res.status(500).json({ error: "Failed to load AI engines" })
     }
 }
 
@@ -41,7 +41,12 @@ export async function updateProjectEnginesController(req: Request, res: Response
             return
         }
 
-        const message = error instanceof Error ? error.message : "Failed to update AI engines"
-        res.status(message.includes("Select") || message.includes("plan") ? 400 : 500).json({ error: message })
+        const message = error instanceof Error ? error.message : ""
+        if (message.includes("Select") || message.includes("plan")) {
+            res.status(400).json({ error: message })
+            return
+        }
+        console.error("[project_engines_controller:update]", error)
+        res.status(500).json({ error: "Failed to update AI engines" })
     }
 }

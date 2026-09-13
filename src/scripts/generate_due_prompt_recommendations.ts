@@ -1,3 +1,4 @@
+import "../lib/env"
 import "dotenv/config"
 import prisma from "../lib/prisma"
 import { getEffectivePlanAccess } from "../features/subscription/entitlements"

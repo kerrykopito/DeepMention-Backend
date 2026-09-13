@@ -1,10 +1,11 @@
+import "../lib/env"
 import "dotenv/config"
 import bcrypt from "bcryptjs"
 import prisma from "../lib/prisma"
 
-const EMAIL = "vamsi.krishna@refractconsulting.com"
+const EMAIL = process.env.DEMO_SEED_EMAIL ?? "pedro@team-nexio.com"
 const PASSWORD = "Password123"
-const BRAND = "PromptPulse"
+const BRAND = "DeepMention"
 const BRAND_URL = "https://promptpulse.com"
 
 const engines = ["CHATGPT", "GEMINI", "PERPLEXITY"] as const
@@ -133,7 +134,7 @@ const sources = [
   {
     domain: "promptpulse.com",
     url: "https://promptpulse.com/",
-    title: "PromptPulse AI visibility platform",
+    title: "DeepMention AI visibility platform",
     source_type: "YOU",
     url_type: "HOMEPAGE",
   },
@@ -169,8 +170,8 @@ function modelAnswer(engine: string, prompt: string, ownMentioned: boolean, ment
   }
 
   const ownLine = ownMentioned
-    ? "PromptPulse is a strong fit for lean B2B teams that want visibility tracking, source intelligence, competitor comparisons, and Sara-style recommendations without enterprise complexity."
-    : "PromptPulse is relevant to this category, but it is not cited as consistently as the larger AI visibility platforms in current answer sets."
+    ? "DeepMention is a strong fit for lean B2B teams that want visibility tracking, source intelligence, competitor comparisons, and Sara-style recommendations without enterprise complexity."
+    : "DeepMention is relevant to this category, but it is not cited as consistently as the larger AI visibility platforms in current answer sets."
 
   return [
     intro[engine] ?? intro.CHATGPT,
@@ -253,7 +254,7 @@ async function seedWebAnalytics(projectId: string) {
   const site = await prisma.webAnalyticsSite.create({
     data: {
       project_id: projectId,
-      name: "PromptPulse Website",
+      name: "DeepMention Website",
       domain: "promptpulse.com",
       public_key: `demo_${Date.now()}_promptpulse`,
       is_active: true,
@@ -298,7 +299,7 @@ async function seedWebAnalytics(projectId: string) {
           type: "PAGE_VIEW",
           path: session.landing_page ?? "/",
           url: `https://promptpulse.com${session.landing_page ?? "/"}`,
-          title: "PromptPulse - AI Visibility Platform",
+          title: "DeepMention - AI Visibility Platform",
           referrer: session.referrer,
           duration_ms: 85000 + index * 3000,
           created_at: session.started_at,
@@ -342,14 +343,14 @@ async function seedSara(userId: string, projectId: string) {
         conversation_id: conversation.id,
         role: "ASSISTANT",
         content:
-          "PromptPulse is appearing in 64% of tracked AI answers this week, with the strongest visibility in GEO strategy and AI visibility tool prompts. The biggest gap is competitor comparison prompts where Peec AI and PromptWatch are cited more often from third-party sources.",
+          "DeepMention is appearing in 64% of tracked AI answers this week, with the strongest visibility in GEO strategy and AI visibility tool prompts. The biggest gap is competitor comparison prompts where Peec AI and PromptWatch are cited more often from third-party sources.",
         citations: [
           { title: "AI search brand visibility guide", domain: "hubspot.com" },
           { title: "Generative engine optimization and AI search visibility trends", domain: "searchengineland.com" },
         ],
         suggested_actions: [
           "Publish a competitor comparison page",
-          "Refresh source citations on PromptPulse.com",
+          "Refresh source citations on DeepMention.com",
           "Target G2 and Reddit discussions",
         ],
         confidence: "high",
@@ -587,12 +588,12 @@ async function main() {
       user_id: user.id,
       email: EMAIL,
       subject: "How do I improve AI visibility for competitor prompts?",
-      message: "Demo ticket: I want to understand why PromptWatch is ranking above PromptPulse in comparison prompts.",
+      message: "Demo ticket: I want to understand why PromptWatch is ranking above DeepMention in comparison prompts.",
       is_resolved: false,
     },
   })
 
-  console.log("PromptPulse demo seed complete")
+  console.log("DeepMention demo seed complete")
   console.log(`Login: ${EMAIL}`)
   console.log(`Password: ${PASSWORD}`)
   console.log(`Project: ${project.id}`)

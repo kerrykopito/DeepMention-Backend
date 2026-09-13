@@ -94,6 +94,11 @@ export const createProjectController = async (req: Request, res: Response): Prom
         const status = message.includes('plan') || message.includes('Missing required') || message.includes('supported primary market') || message.includes('Select at least')
             ? 400
             : 500
+        if (status === 500) {
+            console.error("[onboarding_controller:createProject]", error)
+            res.status(500).json({ error: "Failed to create project" })
+            return
+        }
         res.status(status).json({ error: message })
     }
 }

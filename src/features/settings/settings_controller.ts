@@ -22,8 +22,12 @@ export async function getSettingsController(req: Request, res: Response): Promis
 
         res.status(200).json(await getSettings(userId))
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to get settings"
-        res.status(message === "User not found" ? 404 : 500).json({ error: message })
+        if (error instanceof Error && error.message === "User not found") {
+            res.status(404).json({ error: error.message })
+            return
+        }
+        console.error("[settings_controller:getSettings]", error)
+        res.status(500).json({ error: "Failed to get settings" })
     }
 }
 
@@ -57,6 +61,11 @@ export async function updatePasswordController(req: Request, res: Response): Pro
             message === "New password must be different from current password" ? 400 :
             500
 
+        if (statusCode === 500) {
+            console.error("[settings_controller:updatePassword]", error)
+            res.status(500).json({ error: "Failed to update password" })
+            return
+        }
         res.status(statusCode).json({ error: message })
     }
 }
@@ -71,7 +80,17 @@ export async function updateAccountTypeController(req: Request, res: Response): 
         const { user: { id: userId } } = req as AuthenticatedRequest
         res.status(200).json(await updateAccountType(userId, parsed.data.account_type))
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to update account type"
-        res.status(message === "User not found" ? 404 : 409).json({ error: message })
+        const message = error instanceof Error ? error.message : ""
+        if (message === "User not found") {
+            res.status(404).json({ error: message })
+            return
+        }
+        if (message === "Agency accounts cannot be converted to individual accounts while shared workspace data exists"
+            || message === "Cancel the active individual subscription before converting to an agency account") {
+            res.status(409).json({ error: message })
+            return
+        }
+        console.error("[settings_controller:updateAccountType]", error)
+        res.status(500).json({ error: "Failed to update account type" })
     }
 }

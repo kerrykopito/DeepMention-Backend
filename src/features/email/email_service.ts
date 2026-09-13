@@ -48,7 +48,7 @@ export async function sendEmail(input: SendEmailInput & { awsConfig?: { region: 
             }
         })
 
-        const source = input.awsConfig?.source || `${process.env.EMAIL_FROM_NAME ?? "PromptPulse"} <${process.env.EMAIL_FROM_ADDRESS ?? "noreply@promptpulse.online"}>`
+        const source = input.awsConfig?.source || `${process.env.EMAIL_FROM_NAME ?? "DeepMention"} <${process.env.EMAIL_FROM_ADDRESS}>`
 
         const command = new SendEmailCommand({
             Source: source,
@@ -78,8 +78,13 @@ export async function sendEmail(input: SendEmailInput & { awsConfig?: { region: 
         throw new Error("BREVO_API_KEY is not configured")
     }
 
-    const fromEmail = process.env.EMAIL_FROM_ADDRESS ?? "noreply@promptpulse.online"
-    const fromName = process.env.EMAIL_FROM_NAME ?? "PromptPulse"
+    // Brevo rejects any sender it hasn't verified, so a default address would fail upstream
+    // with a confusing error rather than here, where the cause is obvious.
+    const fromEmail = process.env.EMAIL_FROM_ADDRESS
+    if (!fromEmail) {
+        throw new Error("EMAIL_FROM_ADDRESS is not configured; it must be an address verified in Brevo")
+    }
+    const fromName = process.env.EMAIL_FROM_NAME ?? "DeepMention"
 
     try {
         const response = await axios.post<BrevoSendResponse>(
@@ -129,16 +134,23 @@ export async function sendEmail(input: SendEmailInput & { awsConfig?: { region: 
 export async function sendVerificationOtpEmail(email: string, otp: string) {
     await sendEmail({
         to: email,
-        subject: "Verify your PromptPulse email",
-        text: `Your PromptPulse verification code is ${otp}. It expires in 10 minutes.`,
+        subject: `Welcome to DeepMention — your code is ${otp}`,
+        text: `Welcome to DeepMention!\n\nYour verification code is ${otp}. It expires in 10 minutes.\n\nIf you did not create an account, you can safely ignore this email.`,
         html: `
-            <div style="font-family:Inter,Arial,sans-serif;background:#f8fafc;padding:28px;color:#0f172a">
-                <div style="max-width:520px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:18px;padding:28px">
-                    <p style="margin:0 0 8px;font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#2563eb">PromptPulse</p>
-                    <h1 style="margin:0 0 12px;font-size:24px;line-height:1.25">Verify your email</h1>
-                    <p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#475569">Use this code to finish creating your PromptPulse workspace.</p>
-                    <div style="font-size:32px;font-weight:800;letter-spacing:.18em;background:#f1f5f9;border:1px solid #dbe4ef;border-radius:14px;padding:18px 20px;text-align:center">${otp}</div>
-                    <p style="margin:20px 0 0;font-size:13px;color:#64748b">This code expires in 10 minutes. If you did not request it, you can safely ignore this email.</p>
+            <div style="font-family:Inter,Segoe UI,Arial,sans-serif;background:#0b1220;padding:32px 16px;color:#0f172a">
+                <div style="max-width:520px;margin:0 auto;background:#ffffff;border-radius:20px;overflow:hidden;box-shadow:0 10px 40px rgba(2,6,23,.35)">
+                    <div style="background:linear-gradient(135deg,#111827,#2563eb);padding:28px 32px;color:#ffffff">
+                        <p style="margin:0;font-size:13px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:#bfdbfe">DeepMention</p>
+                        <h1 style="margin:8px 0 0;font-size:26px;line-height:1.2;color:#ffffff">Welcome aboard 👋</h1>
+                    </div>
+                    <div style="padding:32px">
+                        <p style="margin:0 0 22px;font-size:15px;line-height:1.6;color:#475569">Thanks for signing up. Enter this code to verify your email and finish creating your workspace:</p>
+                        <div style="font-size:34px;font-weight:800;letter-spacing:.22em;color:#111827;background:#f1f5f9;border:1px solid #dbe4ef;border-radius:14px;padding:20px;text-align:center">${otp}</div>
+                        <p style="margin:22px 0 0;font-size:13px;line-height:1.6;color:#64748b">This code expires in <strong>10 minutes</strong>. If you did not request it, you can safely ignore this email — no account will be created.</p>
+                    </div>
+                    <div style="padding:16px 32px;border-top:1px solid #eef2f7;background:#f8fafc">
+                        <p style="margin:0;font-size:12px;color:#94a3b8">Sent by DeepMention · welcome@deepmention.xyz</p>
+                    </div>
                 </div>
             </div>
         `,
@@ -148,8 +160,8 @@ export async function sendVerificationOtpEmail(email: string, otp: string) {
 export async function sendAgencyInvitationEmail(email: string, agencyEmail: string, inviteUrl: string) {
     await sendEmail({
         to: email,
-        subject: `${agencyEmail} invited you to PromptPulse`,
-        text: `${agencyEmail} invited you to collaborate in PromptPulse. Accept your invitation here: ${inviteUrl}`,
-        html: `<div style="font-family:Inter,Arial,sans-serif;background:#f8fafc;padding:28px;color:#0f172a"><div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:18px;padding:28px"><p style="margin:0 0 8px;font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#2563eb">PromptPulse</p><h1 style="margin:0 0 12px;font-size:24px">You have a new workspace invitation</h1><p style="color:#475569;line-height:1.6">${agencyEmail} invited you to collaborate with their agency in PromptPulse.</p><a href="${inviteUrl}" style="display:inline-block;background:#0f172a;color:#fff;padding:13px 18px;border-radius:10px;text-decoration:none;font-weight:700">Accept invitation</a><p style="font-size:13px;color:#64748b;line-height:1.6">This invitation expires in 7 days.</p></div></div>`,
+        subject: `${agencyEmail} invited you to DeepMention`,
+        text: `${agencyEmail} invited you to collaborate in DeepMention. Accept your invitation here: ${inviteUrl}`,
+        html: `<div style="font-family:Inter,Arial,sans-serif;background:#f8fafc;padding:28px;color:#0f172a"><div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:18px;padding:28px"><p style="margin:0 0 8px;font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#2563eb">DeepMention</p><h1 style="margin:0 0 12px;font-size:24px">You have a new workspace invitation</h1><p style="color:#475569;line-height:1.6">${agencyEmail} invited you to collaborate with their agency in DeepMention.</p><a href="${inviteUrl}" style="display:inline-block;background:#0f172a;color:#fff;padding:13px 18px;border-radius:10px;text-decoration:none;font-weight:700">Accept invitation</a><p style="font-size:13px;color:#64748b;line-height:1.6">This invitation expires in 7 days.</p></div></div>`,
     })
 }

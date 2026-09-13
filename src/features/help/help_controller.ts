@@ -32,8 +32,8 @@ export async function createTicketController(req: Request, res: Response): Promi
             ticket,
         })
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to create help ticket"
-        res.status(500).json({ success: false, error: message })
+        console.error("[help_controller:createTicket]", error)
+        res.status(500).json({ success: false, error: "Failed to create help ticket" })
     }
 }
 
@@ -47,7 +47,7 @@ export async function getTicketsController(req: Request, res: Response): Promise
             tickets,
         })
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to get help tickets"
-        res.status(500).json({ success: false, error: message })
+        console.error("[help_controller:getTickets]", error)
+        res.status(500).json({ success: false, error: "Failed to get help tickets" })
     }
 }

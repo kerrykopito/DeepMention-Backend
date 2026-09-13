@@ -82,9 +82,8 @@ export const enqueueProjectRunController = async (req: Request, res: Response): 
             res.status(400).json({ error: error.message })
             return
         }
-        res.status(500).json({
-            error: error instanceof Error ? error.message : "Failed to enqueue scrape run"
-        })
+        console.error("[scraping_controller:enqueueScrapeRun]", error)
+        res.status(500).json({ error: "Failed to enqueue scrape run" })
     }
 }
 
@@ -112,8 +111,7 @@ export const getScrapeRunController = async (req: Request, res: Response): Promi
             res.status(404).json({ error: "Run not found" })
             return
         }
-        res.status(500).json({
-            error: error instanceof Error ? error.message : "Failed to get scrape run"
-        })
+        console.error("[scraping_controller:getScrapeRun]", error)
+        res.status(500).json({ error: "Failed to get scrape run" })
     }
 }

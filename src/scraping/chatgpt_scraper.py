@@ -12,11 +12,13 @@ Before scraping an engine, log in once:
 from __future__ import annotations
 
 import asyncio
+import os
+import secrets
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -26,6 +28,23 @@ from scraper.runner import run_batch, run_job
 
 app = FastAPI(title="India AI UI Scraper")
 executor = ThreadPoolExecutor(max_workers=1)
+
+
+# SECURITY: the scrape endpoints drive real logged-in browser sessions, so they must not be
+# open to the internet. Require a shared bearer token from the SCRAPER_API_TOKEN env var and
+# FAIL CLOSED when it is unset (no token configured => every scrape request is rejected).
+def require_api_token(authorization: str | None = Header(default=None)) -> None:
+    expected = os.environ.get("SCRAPER_API_TOKEN")
+    if not expected:
+        raise HTTPException(status_code=503, detail="Scraper API auth is not configured")
+    prefix = "Bearer "
+    provided = (
+        authorization[len(prefix):]
+        if authorization and authorization.startswith(prefix)
+        else ""
+    )
+    if not provided or not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing API token")
 
 
 class ScrapeRequest(BaseModel):
@@ -60,7 +79,7 @@ def health() -> dict[str, str]:
     return {"status": "ok", "mode": "india-ui-profiles"}
 
 
-@app.post("/scrape/chatgpt")
+@app.post("/scrape/chatgpt", dependencies=[Depends(require_api_token)])
 async def scrape_chatgpt_endpoint(body: ScrapeRequest) -> dict:
     result = await run_job(
         ScrapeJob(
@@ -72,7 +91,7 @@ async def scrape_chatgpt_endpoint(body: ScrapeRequest) -> dict:
     return result.to_legacy_response()
 
 
-@app.post("/scrape/batch")
+@app.post("/scrape/batch", dependencies=[Depends(require_api_token)])
 async def scrape_batch_endpoint(body: ApiBatchRequest) -> dict:
     if body.min_delay_seconds > body.max_delay_seconds:
         raise HTTPException(status_code=400, detail="min_delay_seconds must be <= max_delay_seconds")
@@ -92,7 +111,7 @@ async def scrape_batch_endpoint(body: ApiBatchRequest) -> dict:
     return {"results": [result.model_dump(mode="json") for result in results]}
 
 
-@app.post("/scrape/{engine}")
+@app.post("/scrape/{engine}", dependencies=[Depends(require_api_token)])
 async def scrape_engine_endpoint(engine: EngineName, body: ScrapeRequest) -> dict:
     result = await run_job(
         ScrapeJob(

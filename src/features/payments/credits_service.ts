@@ -3,10 +3,12 @@
  * Core credits engine: check balance, deduct, award, and fetch history.
  */
 
+import type Stripe from "stripe"
 import prisma from "../../lib/prisma"
 import { AccountType, Plan, Prisma, SubscriptionStatus } from "@prisma/client"
-import { CREDIT_ACTIONS, LOW_BALANCE_THRESHOLD, creditPolicyFor, signupBonusFor, type CreditAction } from "./credits_config"
+import { CREDIT_ACTIONS, LOW_BALANCE_THRESHOLD, creditPolicyFor, signupBonusFor, getCreditPack, getCustomCreditPack, type CreditAction } from "./credits_config"
 import { getBillingPlan, type PaidPlan } from "./billing_catalog"
+import { getStripeClient } from "../subscription/stripe_config"
 
 export async function getBillingAccountContext(userId: string): Promise<{ billingUserId: string; accountType: AccountType }> {
     const user = await prisma.user.findUnique({ where: { id: userId }, select: { account_type: true } })
@@ -351,4 +353,83 @@ export async function grantDueAnnualSubscriptionCreditsForUser(actorUserId: stri
         }
         await prisma.subscription.update({ where: { id: subscription.id }, data: { next_credit_grant_at: scheduledFor } })
     }
+}
+
+/**
+ * Create a one-time Stripe Checkout Session (mode: "payment") for a PAYG credit pack.
+ * Accepts either a catalog pack_id or a custom credit amount (priced via getCustomCreditPack).
+ */
+export async function createCreditPackCheckoutSession(
+    userId: string,
+    input: { pack_id?: string; custom_credits?: number },
+    requestId?: string,
+) {
+    const accountType = await getBillingAudience(userId)
+    const pack = input.pack_id
+        ? getCreditPack(input.pack_id)
+        : input.custom_credits
+            ? getCustomCreditPack(input.custom_credits, accountType)
+            : null
+    if (!pack) throw new Error("Invalid credit pack")
+
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true } })
+    if (!user) throw new Error("User not found")
+
+    const stripe = getStripeClient()
+    const frontendUrl = process.env.FRONTEND_URL ?? "http://localhost:5173"
+    const automaticTax = process.env.STRIPE_AUTOMATIC_TAX_ENABLED === "true"
+    const totalCredits = pack.credits + pack.bonus_credits
+
+    const session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        customer_email: user.email,
+        client_reference_id: user.id,
+        line_items: [
+            {
+                price_data: {
+                    currency: "eur",
+                    unit_amount: pack.amount_EUR,
+                    product_data: { name: pack.label },
+                },
+                quantity: 1,
+            },
+        ],
+        success_url: `${frontendUrl}/billing?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${frontendUrl}/billing?checkout=cancelled`,
+        billing_address_collection: "required",
+        tax_id_collection: { enabled: true },
+        automatic_tax: { enabled: automaticTax },
+        metadata: {
+            user_id: user.id,
+            pack_id: pack.id,
+            credits: String(totalCredits),
+        },
+    }, requestId ? { idempotencyKey: `credit-pack-checkout:${user.id}:${requestId}` } : undefined)
+
+    if (!session.url) throw new Error("Stripe checkout session URL was not created")
+
+    return {
+        checkout_session_id: session.id,
+        checkout_url: session.url,
+        pack_id: pack.id,
+        credits: totalCredits,
+    }
+}
+
+/**
+ * Award credits from a completed one-time-payment Checkout Session.
+ * Called from the Stripe webhook; relies on the webhook's own per-event-id
+ * dedup (StripeWebhookEvent) for idempotency, same as invoice/subscription events.
+ */
+export async function awardCreditPackFromCheckoutSession(session: Stripe.Checkout.Session) {
+    const userId = session.metadata?.user_id ?? session.client_reference_id
+    const packId = session.metadata?.pack_id
+    const credits = Number(session.metadata?.credits)
+    if (!userId || !packId || !Number.isFinite(credits) || credits <= 0) {
+        throw new Error("Checkout session is missing credit pack metadata")
+    }
+    await awardCredits(userId, credits, "CREDIT_PACK_PURCHASE", `Purchased ${packId}`, {
+        pack_id: packId,
+        checkout_session_id: session.id,
+    })
 }

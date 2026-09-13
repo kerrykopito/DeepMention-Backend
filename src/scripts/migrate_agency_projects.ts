@@ -1,3 +1,4 @@
+import "../lib/env"
 import prisma from "../lib/prisma"
 
 async function run() {

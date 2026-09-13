@@ -137,8 +137,8 @@ async function sendProjectWeeklyReport(input: {
 
         const response = await sendEmail({
             to: input.email,
-            subject: `Your weekly PromptPulse report for ${input.brandName}`,
-            text: `Your weekly PromptPulse AI visibility report for ${input.brandName} is attached.`,
+            subject: `Your weekly DeepMention report for ${input.brandName}`,
+            text: `Your weekly DeepMention AI visibility report for ${input.brandName} is attached.`,
             html: buildWeeklyReportEmailHtml({
                 brandName: input.brandName,
                 periodStart: input.periodStart,
@@ -221,7 +221,7 @@ function buildWeeklyReportEmailHtml(input: {
         <div style="font-family:Inter,Arial,sans-serif;background:#f8fafc;padding:28px;color:#0f172a">
             <div style="max-width:620px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:18px;overflow:hidden">
                 <div style="background:#0f172a;color:white;padding:24px 28px">
-                    <p style="margin:0 0 8px;font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#93c5fd">PromptPulse Weekly Report</p>
+                    <p style="margin:0 0 8px;font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#93c5fd">DeepMention Weekly Report</p>
                     <h1 style="margin:0;font-size:24px;line-height:1.25">Your AI visibility report is ready</h1>
                 </div>
                 <div style="padding:26px 28px">
@@ -233,11 +233,11 @@ function buildWeeklyReportEmailHtml(input: {
                         <p style="margin:4px 0 0;font-size:16px;font-weight:800;color:#0f172a">${period}</p>
                     </div>
                     <p style="margin:0 0 18px;font-size:14px;line-height:1.6;color:#475569">
-                        The PDF is attached. Open PromptPulse to review prompts, source movement, competitors, and opportunities in more detail.
+                        The PDF is attached. Open DeepMention to review prompts, source movement, competitors, and opportunities in more detail.
                     </p>
                     <a href="${process.env.FRONTEND_APP_URL ?? "http://localhost:5173/dashboard"}" style="display:inline-block;background:#0f172a;color:white;text-decoration:none;border-radius:12px;padding:12px 16px;font-size:13px;font-weight:800">Open dashboard</a>
                     <p style="margin:24px 0 0;font-size:12px;line-height:1.5;color:#94a3b8">
-                        You are receiving this because weekly email reports are enabled for your PromptPulse workspace.
+                        You are receiving this because weekly email reports are enabled for your DeepMention workspace.
                     </p>
                 </div>
             </div>

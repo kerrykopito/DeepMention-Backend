@@ -1,6 +1,6 @@
 import axios from 'axios'
-import https from 'https'
 import { hasFirecrawlKey, scrapeWithFirecrawl, type FirecrawlPage } from './crawlers/firecrawl_client'
+import { assertPublicUrl, BlockedUrlError } from '../../lib/safe_url'
 
 type CrawledPage = {
     url: string
@@ -132,10 +132,14 @@ function normalizeUrl(value: string): string {
     return url.toString().replace(/\/$/, '')
 }
 
+const MAX_REDIRECT_HOPS = 5
+
 async function fetchPage(url: string): Promise<{ url: string; html: string }> {
     const requestConfig = {
         timeout: 15000,
-        maxRedirects: 5,
+        // Redirects are followed by hand so every hop is re-checked against assertPublicUrl;
+        // letting axios follow them would skip the check on all but the first address.
+        maxRedirects: 0,
         responseType: 'text',
         headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
@@ -144,29 +148,25 @@ async function fetchPage(url: string): Promise<{ url: string; html: string }> {
         validateStatus: (status: number) => status >= 200 && status < 400,
     } as const
 
-    let response
-    try {
-        response = await axios.get<string>(url, requestConfig)
-    } catch (error) {
-        if (!isLocalCertificateError(error)) throw error
-        response = await axios.get<string>(url, {
-            ...requestConfig,
-            httpsAgent: new https.Agent({ rejectUnauthorized: false }),
-        })
+    let currentUrl = url
+
+    for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
+        const safeUrl = await assertPublicUrl(currentUrl)
+        const response = await axios.get<string>(safeUrl.toString(), requestConfig)
+
+        const location = response.headers?.location
+        if (response.status >= 300 && response.status < 400 && typeof location === 'string') {
+            currentUrl = new URL(location, safeUrl).toString()
+            continue
+        }
+
+        return {
+            url: response.request?.res?.responseUrl || safeUrl.toString(),
+            html: response.data,
+        }
     }
 
-    return {
-        url: response.request?.res?.responseUrl || url,
-        html: response.data,
-    }
-}
-
-function isLocalCertificateError(error: unknown): boolean {
-    return process.env.NODE_ENV !== 'production'
-        && typeof error === 'object'
-        && error !== null
-        && 'code' in error
-        && (error as { code?: string }).code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE'
+    throw new BlockedUrlError('That website redirected too many times.')
 }
 
 function extractPage(url: string, html: string): CrawledPage {
