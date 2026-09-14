@@ -41,9 +41,6 @@
     "seed:demo-history": "tsx src/scripts/seed_demo_history.ts",
     "seed:verified-user": "tsx src/scripts/upsert_verified_user.ts",
     "test": "echo \"Error: no test specified\" && exit 1",
-    "whatsapp:migrate-tokens": "tsx src/scripts/migrate_whatsapp_tokens.ts",
-    "test:whatsapp:unit": "tsx --test src/features/campaigns/whatsapp/whatsapp.test.ts",
-    "test:whatsapp:e2e": "tsx src/scripts/test_whatsapp_e2e.ts",
     "backfill:forum-sources": "tsx src/scripts/backfill_forum_sources.ts",
     "postinstall": "prisma generate"
   },

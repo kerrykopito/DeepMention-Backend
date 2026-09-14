@@ -31,3 +31,6 @@ Thumbs.db
 
 .vercel
 .env*
+
+# Export-QA render output — never track
+tmp/

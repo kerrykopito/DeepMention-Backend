@@ -1,3 +1,4 @@
+import { resolveFrontendUrl } from "../../lib/env"
 import crypto from "crypto"
 import bcrypt from "bcryptjs"
 import prisma from "../../lib/prisma"
@@ -55,7 +56,7 @@ export async function createPortalShare(input: CreatePortalShareInput) {
         },
     })
 
-    const appUrl = process.env.FRONTEND_URL ?? "http://localhost:5173"
+    const appUrl = resolveFrontendUrl()
 
     return {
         id: share.id,
@@ -85,7 +86,7 @@ export async function listProjectPortalShares(actorUserId: string, projectId?: s
         },
     })
 
-    const appUrl = process.env.FRONTEND_URL ?? "http://localhost:5173"
+    const appUrl = resolveFrontendUrl()
 
     return shares.map((s) => ({
         id: s.id,

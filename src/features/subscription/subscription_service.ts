@@ -1,5 +1,6 @@
 import type Stripe from "stripe"
 import { Plan, SubscriptionStatus } from "@prisma/client"
+import { resolveFrontendUrl } from "../../lib/env"
 import prisma from "../../lib/prisma"
 import type {
     CreateSubscriptionInput,
@@ -147,7 +148,7 @@ export async function createSubscription(input: CreateSubscriptionInput): Promis
         })
     ).id
 
-    const frontendUrl = process.env.FRONTEND_URL ?? "http://localhost:5173"
+    const frontendUrl = resolveFrontendUrl()
     const automaticTax = process.env.STRIPE_AUTOMATIC_TAX_ENABLED === "true"
     const session = await stripe.checkout.sessions.create({
         mode: "subscription",
@@ -293,7 +294,7 @@ export async function syncSubscriptionFromStripe(stripeSubscription: Stripe.Subs
 export async function createBillingPortalSession(userId: string) {
     const subscription = await prisma.subscription.findFirst({ where: { user_id: userId, stripe_customer_id: { not: null } }, orderBy: { created_at: "desc" } })
     if (!subscription?.stripe_customer_id) throw new Error("No Stripe billing account found")
-    const frontendUrl = process.env.FRONTEND_URL ?? "http://localhost:5173"
+    const frontendUrl = resolveFrontendUrl()
     const session = await getStripeClient().billingPortal.sessions.create({ customer: subscription.stripe_customer_id, return_url: `${frontendUrl}/subscription` })
     return { url: session.url }
 }

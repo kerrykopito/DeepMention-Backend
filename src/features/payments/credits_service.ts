@@ -4,6 +4,7 @@
  */
 
 import type Stripe from "stripe"
+import { resolveFrontendUrl } from "../../lib/env"
 import prisma from "../../lib/prisma"
 import { AccountType, Plan, Prisma, SubscriptionStatus } from "@prisma/client"
 import { CREDIT_ACTIONS, LOW_BALANCE_THRESHOLD, creditPolicyFor, signupBonusFor, getCreditPack, getCustomCreditPack, type CreditAction } from "./credits_config"
@@ -376,7 +377,7 @@ export async function createCreditPackCheckoutSession(
     if (!user) throw new Error("User not found")
 
     const stripe = getStripeClient()
-    const frontendUrl = process.env.FRONTEND_URL ?? "http://localhost:5173"
+    const frontendUrl = resolveFrontendUrl()
     const automaticTax = process.env.STRIPE_AUTOMATIC_TAX_ENABLED === "true"
     const totalCredits = pack.credits + pack.bonus_credits
 

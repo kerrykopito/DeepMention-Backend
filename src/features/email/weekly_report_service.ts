@@ -1,5 +1,6 @@
 import crypto from "node:crypto"
 import { Plan } from "@prisma/client"
+import { resolveFrontendUrl } from "../../lib/env"
 import prisma from "../../lib/prisma"
 import { createPdfExport } from "../exports/export_service"
 import { sendEmail } from "./email_service"
@@ -235,7 +236,7 @@ function buildWeeklyReportEmailHtml(input: {
                     <p style="margin:0 0 18px;font-size:14px;line-height:1.6;color:#475569">
                         The PDF is attached. Open DeepMention to review prompts, source movement, competitors, and opportunities in more detail.
                     </p>
-                    <a href="${process.env.FRONTEND_APP_URL ?? "http://localhost:5173/dashboard"}" style="display:inline-block;background:#0f172a;color:white;text-decoration:none;border-radius:12px;padding:12px 16px;font-size:13px;font-weight:800">Open dashboard</a>
+                    <a href="${resolveFrontendUrl()}/dashboard" style="display:inline-block;background:#0f172a;color:white;text-decoration:none;border-radius:12px;padding:12px 16px;font-size:13px;font-weight:800">Open dashboard</a>
                     <p style="margin:24px 0 0;font-size:12px;line-height:1.5;color:#94a3b8">
                         You are receiving this because weekly email reports are enabled for your DeepMention workspace.
                     </p>

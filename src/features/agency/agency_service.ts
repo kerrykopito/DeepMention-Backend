@@ -1,3 +1,4 @@
+import { resolveFrontendUrl } from "../../lib/env"
 import bcrypt from "bcryptjs"
 import crypto from "crypto"
 import { AgencyInvitationStatus, AgencyInvitationType, AgencyMembershipRole, AgencyMembershipStatus } from "@prisma/client"
@@ -385,7 +386,7 @@ export async function createAgencyInvitation(input: { actorUserId: string; email
         data: { agency_user_id: context.agency_user_id, invitee_user_id: existing?.id, email, type: input.type, role: input.role, token, expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), assigned_project_ids: input.assignedProjectIds ?? [] },
         include: { agency: { select: { email: true } } },
     })
-    const appUrl = process.env.FRONTEND_URL ?? "http://localhost:5173"
+    const appUrl = resolveFrontendUrl()
     try { await sendAgencyInvitationEmail(email, invitation.agency.email, `${appUrl}/agency/invitations/${token}`) } catch (error) {
         if (process.env.NODE_ENV === "production") throw error
         console.warn(`[DEV AGENCY INVITE] ${appUrl}/agency/invitations/${token}`)
