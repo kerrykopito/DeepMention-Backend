@@ -7,6 +7,11 @@ import { buildOverviewPdf } from "./overview/overview_export_pdf"
 import { buildOverviewExcel } from "./overview/overview_export_excel"
 import { getOverviewExportModel } from "./overview/overview_export_data"
 
+// How many rows any one export may pull. Named rather than repeated as a literal so the
+// three export queries cannot drift apart - the source export had no cap at all until now,
+// which is the kind of omission a shared constant makes visible.
+const EXPORT_ROW_LIMIT = 5000
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type CsvValue = string | number | boolean | Date | null | undefined
@@ -331,8 +336,23 @@ async function getChatRows(project_id: string, filters: ExportFilters): Promise<
 async function getSourceRows(project_id: string, filters: ExportFilters): Promise<CsvRow[]> {
     const sources = await prisma.source.findMany({
         where: { chat: buildChatWhere(project_id, filters) },
-        include: { chat: { include: { prompt: true, brand_mentions: true } }, source_url_content: true },
+        // Named fields rather than `include`, which would pull every Chat scalar - including
+        // raw_response, about 3KB per row, fetched once per Source and so roughly eight times
+        // per answer - only for the five values the mapper below actually reads.
+        include: {
+            chat: {
+                select: {
+                    ai_model: true,
+                    created_at: true,
+                    prompt: { select: { text: true, topic: true } },
+                    brand_mentions: { select: { brand_name: true } },
+                },
+            },
+            source_url_content: true,
+        },
         orderBy: { created_at: "desc" },
+        // The other export queries in this file already cap at 5000; this one was missed.
+        take: EXPORT_ROW_LIMIT,
     })
     return sources.map(s => ({
         source_id: s.id,
@@ -392,7 +412,7 @@ async function getWebAnalyticsRows(project_id: string, filters: ExportFilters): 
         },
         include: { site: true, session: true },
         orderBy: { created_at: "desc" },
-        take: 5000,
+        take: EXPORT_ROW_LIMIT,
     })
     return events.map(e => ({
         event_id: e.id,
@@ -420,7 +440,7 @@ async function getFilteredChats(project_id: string, filters: ExportFilters) {
         where: buildChatWhere(project_id, filters),
         include: { prompt: true, brand_mentions: true, sources: true },
         orderBy: { created_at: "desc" },
-        take: 5000,
+        take: EXPORT_ROW_LIMIT,
     })
 }
 

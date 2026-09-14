@@ -156,10 +156,15 @@ export async function getUrlReport(project_id: string, filters: DashboardFilters
         where: { chat: { ...buildChatWhere(project_id, filters), run: { project_id } } },
         include: {
             source_url_content: true,
+            // `select`, not `include`. Prisma's include pulls every scalar on Chat, which
+            // means raw_response - roughly 3KB of answer text per row - and answer_blocks.
+            // There are about eight Sources per Chat, so each answer was being fetched eight
+            // times over; across a year of one project that is gigabytes crossing the wire to
+            // read one string. The brand_mentions relation was loaded here and never read at
+            // all: this function derives its brands from Source.mentioned_brands instead.
             chat: {
-                include: {
-                    brand_mentions: true,
-                    prompt: true
+                select: {
+                    prompt: { select: { text: true } }
                 }
             }
         },

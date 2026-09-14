@@ -36,18 +36,22 @@ function notFound(code: NotFoundErrorCode): Error {
  * For an AGENCY account: [user_id, ...all ACTIVE linked client user_ids].
  */
 export async function getAccessibleUserIds(user_id: string): Promise<string[]> {
-    // 1. Direct active clients if caller is an agency owner
-    const links = await prisma.agencyClientLink.findMany({
-        where: { agency_user_id: user_id, status: "ACTIVE" },
-        select: { client_user_id: true },
-    })
+    // 1 and 2 are independent of each other, so they go in one round trip rather than two.
+    // This function runs on every authorised request, and the dashboard opens five endpoints
+    // at once, so a saved hop here is saved five times per page load.
+    const [links, memberships] = await Promise.all([
+        // Direct active clients if caller is an agency owner
+        prisma.agencyClientLink.findMany({
+            where: { agency_user_id: user_id, status: "ACTIVE" },
+            select: { client_user_id: true },
+        }),
+        // Active agencies if caller is an agency team member / staff
+        prisma.agencyMembership.findMany({
+            where: { member_user_id: user_id, status: "ACTIVE" },
+            select: { agency_user_id: true },
+        }),
+    ])
     const clientIds = links.map(l => l.client_user_id)
-
-    // 2. Active agencies if caller is an agency team member / staff
-    const memberships = await prisma.agencyMembership.findMany({
-        where: { member_user_id: user_id, status: "ACTIVE" },
-        select: { agency_user_id: true },
-    })
     const staffAgencyIds = memberships.map(m => m.agency_user_id)
 
     // 3. Active clients for those agencies (staff access)
@@ -92,8 +96,12 @@ export async function getAgencyClientIds(agency_user_id: string): Promise<string
 // ─── Project access ───────────────────────────────────────────────────────────
 
 export async function assertAgencyProjectAccess(project_id: string, user_id: string) {
-    const accessibleUserIds = await getAccessibleUserIds(user_id)
-    const assignedProjectIds = await getAssignedProjectIds(user_id)
+    // Neither lookup feeds the other - they are two separate ways of reaching a project - so
+    // they resolve together. Both are needed before the project query can run.
+    const [accessibleUserIds, assignedProjectIds] = await Promise.all([
+        getAccessibleUserIds(user_id),
+        getAssignedProjectIds(user_id),
+    ])
 
     const project = await prisma.project.findFirst({
         where: {

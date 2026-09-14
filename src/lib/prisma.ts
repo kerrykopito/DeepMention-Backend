@@ -22,7 +22,12 @@ function createPrismaClient() {
             : undefined,
       }
     : undefined;
-  const adapter = new PrismaPg({ connectionString, ssl });
+  // One connection per instance, not the pg default of ten. On Vercel each concurrent
+  // function instance evaluates this module separately and gets its own pool, so a default
+  // pool multiplies by the number of warm instances: a handful of them is enough to exhaust
+  // Postgres and start answering "too many connections" — a 500, not a slow page. Serverless
+  // scales by adding instances, so each one needs exactly one connection.
+  const adapter = new PrismaPg({ connectionString, ssl, max: 1, idleTimeoutMillis: 10_000 });
   return new PrismaClient({ adapter });
 }
 
