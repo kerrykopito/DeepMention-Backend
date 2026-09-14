@@ -28,7 +28,11 @@ export async function assertProjectMutationAccess(project_id: string, user_id: s
             select: { role: true }
         })
 
-        if (link?.role === 'CLIENT_VIEWER') {
+        // An allow-list, not a deny-list. Testing for CLIENT_VIEWER meant every other value
+        // granted write access, and `role` is an unconstrained String in the schema - so a
+        // typo, a new role added later, or the unvalidated role written by
+        // updateClientSettings would all fail open. Only the role that is meant to write can.
+        if (link?.role !== 'CLIENT_ADMIN') {
             throw Object.assign(new Error("Read-only access: Client viewers cannot modify projects or prompts."), { status: 403 })
         }
     }

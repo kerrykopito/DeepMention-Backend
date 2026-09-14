@@ -1,7 +1,7 @@
 import { Engine } from "@prisma/client"
 import prisma from "../../lib/prisma"
 import { getEffectivePlanAccess } from "../subscription/entitlements"
-import { assertProjectAccess } from "../projects/project_access"
+import { assertProjectMutationAccess } from "../projects/project_access"
 import {
     DEFAULT_PROJECT_ENGINES,
     SELECTABLE_PROJECT_ENGINES,
@@ -27,7 +27,9 @@ export async function assertCanUseProjectEngines(userId: string, rawEngines: unk
 
 
 export async function setProjectEngines(projectId: string, userId: string, rawEngines: unknown) {
-    await assertProjectAccess(projectId, userId)
+    // Changing which engines a project tracks is a mutation, and it costs credits on every
+    // subsequent run - so it needs the write check, not the read one a viewer also passes.
+    await assertProjectMutationAccess(projectId, userId)
     const engines = await assertCanUseProjectEngines(userId, rawEngines)
 
     await prisma.$transaction(async tx => {

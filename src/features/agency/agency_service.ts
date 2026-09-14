@@ -438,8 +438,23 @@ export async function addAgencyClient(agencyUserId: string, clientEmail: string)
         await assertAgencyManager(agencyUserId)
         if (!existing.is_verified) throw Object.assign(new Error("That user has not verified their email yet"), { status: 400 })
         if (existing.account_type === "AGENCY") throw Object.assign(new Error("Cannot link another agency account"), { status: 400 })
-        return prisma.agencyClientLink.upsert({ where: { agency_user_id_client_user_id: { agency_user_id: agencyUserId, client_user_id: existing.id } }, create: { agency_user_id: agencyUserId, client_user_id: existing.id }, update: { status: "ACTIVE" } })
     }
+
+    // Every client link is created by invitation, whether or not the account already exists.
+    //
+    // This branch used to upsert an AgencyClientLink directly for an existing account, and
+    // because the create named neither column, the schema defaults applied: status ACTIVE and
+    // role CLIENT_ADMIN. The link was therefore born live, with write access, without the
+    // account owner accepting or being told. Since becoming an agency is self-service
+    // (settings_service.updateAccountType) and agency owners pass assertAgencyManager by
+    // virtue of account_type alone, any signed-up user could name a stranger's email address
+    // and take over their workspace - read their answers, delete their prompts, spend against
+    // their credits - with nothing on the victim's side to see or revoke.
+    //
+    // createAgencyInvitation already handles an existing account correctly: it records
+    // invitee_user_id, emails a random token, and grants nothing until acceptAgencyInvitation
+    // is called by the invitee themselves. The `update: { status: "ACTIVE" }` is gone with it,
+    // which also stops a re-POST silently reactivating a link the agency had suspended.
     return createAgencyInvitation({ actorUserId: agencyUserId, email: clientEmail, type: AgencyInvitationType.CLIENT_USER, role: AgencyMembershipRole.CLIENT_ADMIN })
 }
 
