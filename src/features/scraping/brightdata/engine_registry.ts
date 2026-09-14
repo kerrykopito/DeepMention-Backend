@@ -30,6 +30,15 @@ export function buildBrightDataInput(
     })
 }
 
+/**
+ * True when this engine has a usable Bright Data dataset id, whether from the environment or
+ * from the config's own default. Only three engines carry a default, so the rest depend
+ * entirely on a variable being set in whatever runtime is scraping.
+ */
+export function hasScraperId(engine: UiEngine) {
+    return Boolean(getScraperId(engine))
+}
+
 export function getScraperId(engine: UiEngine) {
     if (
         engine === "google_ai_overview"

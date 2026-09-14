@@ -25,6 +25,17 @@ export default defineRailway(() => {
             GEMINI_API_KEY: preserve(),
             GROQ_API_KEY: preserve(),
 
+            // Which Bright Data dataset to drive per engine. Only chatgpt, perplexity and
+            // google_ai_mode carry a default in code; gemini and copilot resolve purely from
+            // here, so an unset id used to mean every job for that engine threw at runtime.
+            // They are not credentials, but they are account-specific, so preserve() keeps
+            // them out of the repository alongside the keys.
+            BRIGHT_DATA_GEMINI_SCRAPER_ID: preserve(),
+            BRIGHT_DATA_COPILOT_SCRAPER_ID: preserve(),
+            BRIGHT_DATA_CHATGPT_SCRAPER_ID: preserve(),
+            BRIGHT_DATA_PERPLEXITY_SCRAPER_ID: preserve(),
+            BRIGHT_DATA_GOOGLE_AI_MODE_SCRAPER_ID: preserve(),
+
             // Selects the drain shape in docker-entrypoint.worker.sh, whose default is the
             // always-on worker - so losing this value turns the cron job into a service that
             // never stops billing.
