@@ -4,12 +4,23 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 
+# Prisma's query engine needs OpenSSL, and node:22-slim does not ship it. Without this,
+# `prisma generate` warns that it cannot detect the libssl version and guesses openssl-1.1.x,
+# which produces an engine that may not load at runtime.
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends openssl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# The schema has to be in place BEFORE npm ci, not after. package.json runs `prisma generate`
+# as a postinstall hook, so npm ci triggers it while only package*.json exist - Prisma then
+# fails with "Could not find Prisma Schema" and takes the whole build down with it.
 COPY package*.json ./
+COPY prisma ./prisma
+COPY prisma.config.ts ./
+
 RUN npm ci --omit=dev
 
-COPY prisma ./prisma
 COPY src ./src
-COPY prisma.config.ts ./
 COPY docker-entrypoint.worker.sh ./
 # Supabase CA bundle, read at runtime via DB_SSL_CA_PATH to verify the DB certificate.
 COPY certs ./certs
