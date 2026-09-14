@@ -14,6 +14,7 @@ import type {
     BillingInterval,
 } from "./subscription_types"
 import { getAccessPeriod, getEffectivePlanAccess } from "./entitlements"
+import { PlanLimitError, TRIAL_PROJECT_REASON, evaluateProjectLimit, toProjectLimitCheck, type ProjectLimitVerdict } from "./plan_limits"
 import { getCreditBalance } from "../credits/credits_service"
 import { grantSubscriptionCredits } from "../payments/credits_service"
 import { getRefreshWindowStart } from "../refresh/refresh_window"
@@ -338,21 +339,40 @@ export async function getPlanQuota(userId: string): Promise<PlanQuotaResponse> {
     }
 }
 
-// PAYG: no project or prompt limits — always allow
+/**
+ * Loads everything the workspace limit rules need and returns the verdict. Both the
+ * enforcement helper below and the `can/create-project` reporting endpoint go through
+ * here, so the answer the user is shown is always the answer that will be applied.
+ */
+export async function evaluateCanCreateProject(userId: string, promptCount: number): Promise<ProjectLimitVerdict> {
+    const [access, credits] = await Promise.all([
+        getEffectivePlanAccess(userId),
+        getCreditBalance(userId),
+    ])
+    // The counts are fetched unconditionally because reporting has to state the real usage
+    // even when the answer is "allowed"; the rules themselves are unchanged by this.
+    const [projectCount, activePromptCount] = await Promise.all([
+        prisma.project.count({ where: { user_id: userId } }),
+        prisma.prompt.count({ where: { project: { user_id: userId }, is_active: true, status: "ACTIVE" } }),
+    ])
+
+    return evaluateProjectLimit({
+        plan: access.plan,
+        effective_plan: access.effective_plan,
+        trial_active: access.trial.active,
+        trial_expired: access.trial.expired,
+        credits_remaining: credits.remaining,
+        project_count: projectCount,
+        active_prompt_count: activePromptCount,
+        requested_prompt_count: promptCount,
+    })
+}
+
 export async function assertCanCreateProjectWithPrompts(userId: string, promptCount: number) {
-    const access = await getEffectivePlanAccess(userId)
-    const credits = await getCreditBalance(userId)
-    if (access.trial.expired && access.effective_plan === Plan.FREE && credits.remaining <= 0) {
-        throw new Error("Your free trial has ended. Please upgrade or add credits to create new brand workspaces.")
-    }
-    if (access.trial.active) {
-        const projectCount = await prisma.project.count({ where: { user_id: userId } })
-        if (projectCount >= 1) {
-            throw new Error("Your Free Trial includes 1 Brand Workspace. Upgrade or add credits to manage multiple brands.")
-        }
-        const used = await prisma.prompt.count({ where: { project: { user_id: userId }, is_active: true, status: "ACTIVE" } })
-        if (used + promptCount > 10) throw new Error("Your free trial includes up to 10 prompts. Add a plan or credits to continue.")
-    }
+    const verdict = await evaluateCanCreateProject(userId, promptCount)
+    // A PlanLimitError lets the controller answer 400 with this exact sentence instead of
+    // guessing from the message text what kind of failure it was.
+    if (!verdict.allowed) throw new PlanLimitError(verdict.reason ?? TRIAL_PROJECT_REASON)
     return { allowed: true }
 }
 
@@ -404,12 +424,14 @@ export async function getMyPlan(userId: string): Promise<MyPlanResponse> {
     }
 }
 
-// ── PAYG: all limit checks always return allowed ─────────────────────────────
-// Users are gated by credit balance only, never by plan-based limits.
+// ── The remaining checks are PAYG: users are gated by credit balance only ────
+// The project check is the exception — it reports whatever the enforcement rules decide.
 
 export async function canCreateProject(userId: string): Promise<LimitCheckResponse> {
-    const user = await prisma.user.findUnique({ where: { id: userId }, select: { plan: true } })
-    return buildCheck("project", (user?.plan ?? "FREE") as Plan, "unlimited", 0, true)
+    // Reporting asks about a workspace that has no prompts yet, so no prompts are
+    // requested; the prompt allowance still shows up if the account is already over it.
+    const verdict = await evaluateCanCreateProject(userId, 0)
+    return toProjectLimitCheck(verdict)
 }
 
 export async function canCreatePrompt(userId: string): Promise<LimitCheckResponse> {

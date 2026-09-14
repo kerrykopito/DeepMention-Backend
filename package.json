@@ -27,6 +27,7 @@
     "weekly-email:send": "tsx src/scripts/send_weekly_email_reports.ts",
     "test:bedrock-analysis": "tsx src/scripts/test_bedrock_analysis.ts",
     "test:brand-matching": "tsx src/features/brands/strict_brand_matcher.test.ts",
+    "test:plan-limits": "tsx src/features/subscription/plan_limits.test.ts",
     "test:kimi-analysis": "tsx src/features/llm/analysis/analysis_schema.test.ts",
     "test:kimi-analysis:live": "tsx src/scripts/test_kimi_brand_analysis.ts",
     "test:scrape": "tsx src/scripts/test_scrape_runtime.ts",
