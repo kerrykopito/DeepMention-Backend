@@ -1,15 +1,70 @@
-# Builds one worker image and deploys the scrape worker from it.
-#
-# The same image serves the source-enrichment worker and the weekly email job -
-# WORKER_KIND selects which process runs. See README.md at the project root for
-# why those two are not deployed here yet.
+# Builds one worker image and deploys all three background processes from it -
+# WORKER_KIND selects which one runs inside the container.
 #
 #   gcloud builds submit --config cloudbuild.worker.yaml .
+#
+# ─── One-time setup before the first run ──────────────────────────────────────
+#
+# 1. Create the secrets (values come from your .env, never from this file):
+#
+#      printf '%s' "$DATABASE_URL" | gcloud secrets create DATABASE_URL --data-file=-
+#      ...and the same for REDIS_URL, BRIGHT_DATA_API_KEY, GEMINI_API_KEY,
+#         GROQ_API_KEY, BREVO_API_KEY
+#
+# 2. Create the runtime service account and let it read secrets - and nothing else:
+#
+#      gcloud iam service-accounts create deepmention-worker
+#      gcloud projects add-iam-policy-binding $PROJECT_ID \
+#        --member=serviceAccount:deepmention-worker@$PROJECT_ID.iam.gserviceaccount.com \
+#        --role=roles/secretmanager.secretAccessor
+#
+# 3. Schedule the weekly email job (Monday 09:00) once it has deployed:
+#
+#      gcloud scheduler jobs create http deepmention-weekly-email \
+#        --schedule="0 9 * * 1" --time-zone="Europe/Madrid" --location=${_REGION} \
+#        --uri="https://${_REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$PROJECT_ID/jobs/${_WEEKLY_JOB}:run" \
+#        --http-method=POST --oauth-service-account-email=${_RUNTIME_SA}@$PROJECT_ID.iam.gserviceaccount.com
+#
+# ─── Why the flags are what they are ──────────────────────────────────────────
+#
+# --update-env-vars (NOT --set-env-vars): --set-env-vars REPLACES the service's
+#   entire environment, so a redeploy would wipe every variable set outside this
+#   file. --update-env-vars merges.
+#
+# --set-secrets: the image deliberately excludes .env (.dockerignore), so the
+#   credentials have to be injected at deploy time. Secret Manager keeps them out
+#   of the service config, versions them, and makes rotation a new version rather
+#   than a redeploy. Note the asymmetry with the line above: --set-secrets REPLACES
+#   the secret list, so the list in each step below is the COMPLETE set for that
+#   service. Adding a secret by hand to a deployed service will not survive the next
+#   build - add it here instead.
+#
+# --no-cpu-throttling: a BullMQ consumer does all of its work OUTSIDE of any HTTP
+#   request. Cloud Run throttles CPU between requests by default, which would
+#   leave the container resident but starved - a worker that reports healthy and
+#   drains nothing. This is the flag that actually keeps it working.
+#
+# --min-instances=1 keeps the consumer alive (Cloud Run would otherwise scale it
+#   to zero and jobs would sit unconsumed); --max-instances=1 keeps it to a single
+#   consumer.
 
 substitutions:
   _REGION: us-east1
   _REPO: agents
   _SERVICE: promptpulse-scrape-worker
+  _SOURCES_SERVICE: promptpulse-sources-worker
+  _WEEKLY_JOB: promptpulse-weekly-email
+  _RUNTIME_SA: deepmention-worker
+  # Needed by the weekly email job only. Pass them at build time:
+  #   gcloud builds submit --config cloudbuild.worker.yaml \
+  #     --substitutions=_EMAIL_FROM_ADDRESS=you@yourdomain.com,_FRONTEND_URL=https://yourdomain.com .
+  # EMAIL_FROM_ADDRESS must be an address you have verified in Brevo, or every
+  # email silently fails to send.
+  # If you omit these, the scrape and sources services still deploy correctly and
+  # only the weekly job fails - it starts, finds FRONTEND_URL empty and throws on
+  # purpose (lib/env.ts:33) rather than emailing customers a dead localhost link.
+  _EMAIL_FROM_ADDRESS: ""
+  _FRONTEND_URL: ""
 
 steps:
   - name: gcr.io/cloud-builders/docker
@@ -31,8 +86,11 @@ steps:
       - --all-tags
       - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/promptpulse-worker
 
-  # min-instances=1 keeps the queue consumer alive; Cloud Run would otherwise
-  # scale it to zero and jobs would sit unconsumed in Redis.
+  # SCRAPER_API_FALLBACK_ENABLED=false is a production correctness setting, not a
+  # performance one. When Bright Data returns nothing, the fallback asks Gemini to
+  # answer instead and the job is recorded as a SUCCESS - credits charged, dashboard
+  # populated, answer invented. Disabling it makes that path fail cleanly and retry
+  # (api_fallback.ts:11). Never turn it on in production.
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     id: deploy-scrape
     entrypoint: gcloud
@@ -44,9 +102,52 @@ steps:
       - --region=${_REGION}
       - --platform=managed
       - --no-allow-unauthenticated
+      - --service-account=${_RUNTIME_SA}@$PROJECT_ID.iam.gserviceaccount.com
       - --min-instances=1
       - --max-instances=1
-      - --set-env-vars=WORKER_KIND=scrape
+      - --no-cpu-throttling
+      - --update-env-vars=WORKER_KIND=scrape,NODE_ENV=production,SCRAPER_API_FALLBACK_ENABLED=false,DB_SSL_CA_PATH=./certs/prod-ca-2021.crt
+      - --set-secrets=DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest,BRIGHT_DATA_API_KEY=BRIGHT_DATA_API_KEY:latest,GEMINI_API_KEY=GEMINI_API_KEY:latest,GROQ_API_KEY=GROQ_API_KEY:latest
+
+  # The source-enrichment worker only reads the queue and writes fetched page
+  # content back to Postgres - it calls no third-party API, so it gets no API keys.
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: deploy-sources
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SOURCES_SERVICE}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/promptpulse-worker:$COMMIT_SHA
+      - --region=${_REGION}
+      - --platform=managed
+      - --no-allow-unauthenticated
+      - --service-account=${_RUNTIME_SA}@$PROJECT_ID.iam.gserviceaccount.com
+      - --min-instances=1
+      - --max-instances=1
+      - --no-cpu-throttling
+      - --update-env-vars=WORKER_KIND=sources,NODE_ENV=production,DB_SSL_CA_PATH=./certs/prod-ca-2021.crt
+      - --set-secrets=DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest
+
+  # A Job, not a service: WORKER_KIND=weekly-once sends the reports and exits.
+  # The alternative - WORKER_KIND=weekly - is a node-cron process that would idle
+  # all week waiting for Monday, billed the whole time. Cloud Scheduler triggers
+  # this (see the setup note at the top).
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: deploy-weekly-job
+    entrypoint: gcloud
+    args:
+      - run
+      - jobs
+      - deploy
+      - ${_WEEKLY_JOB}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/promptpulse-worker:$COMMIT_SHA
+      - --region=${_REGION}
+      - --service-account=${_RUNTIME_SA}@$PROJECT_ID.iam.gserviceaccount.com
+      - --max-retries=1
+      - --task-timeout=30m
+      - --update-env-vars=WORKER_KIND=weekly-once,NODE_ENV=production,DB_SSL_CA_PATH=./certs/prod-ca-2021.crt,EMAIL_PROVIDER=brevo,EMAIL_FROM_NAME=DeepMention,EMAIL_FROM_ADDRESS=${_EMAIL_FROM_ADDRESS},FRONTEND_URL=${_FRONTEND_URL}
+      - --set-secrets=DATABASE_URL=DATABASE_URL:latest,BREVO_API_KEY=BREVO_API_KEY:latest
 
 images:
   - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/promptpulse-worker:latest

@@ -8,6 +8,8 @@
     "start": "tsx server.ts",
     "dev": "tsx server.ts",
     "worker:scrape": "tsx src/workers/scrape_worker.ts",
+    "railway:plan": "node scripts/railway-iac.mjs config plan",
+    "railway:apply": "node scripts/railway-iac.mjs config apply",
     "worker:sources": "tsx src/workers/source_enrichment_worker.ts",
     "workers:all": "concurrently -n scrape,sources,weekly -c cyan,magenta,yellow \"npm:worker:scrape\" \"npm:worker:sources\" \"npm:scheduler:weekly-email\"",
     "dev:all": "concurrently -n api,scrape,sources,weekly -c green,cyan,magenta,yellow \"npm:dev\" \"npm:worker:scrape\" \"npm:worker:sources\" \"npm:scheduler:weekly-email\"",
@@ -87,6 +89,7 @@
     "@types/node-cron": "^3.0.11",
     "@types/pdfkit": "^0.17.6",
     "concurrently": "^10.0.5",
+    "railway": "^3.11.0",
     "typescript": "^6.0.3"
   }
 }

@@ -373,3 +373,23 @@ async function shutdown() {
 
 process.on("SIGINT", shutdown)
 process.on("SIGTERM", shutdown)
+
+// Drain mode: process whatever is queued, then exit, instead of staying up waiting for more.
+//
+// The same file serves both shapes on purpose - a separate drain script would have to duplicate
+// processScrapeJob, and two copies of the credit-charging path is exactly the kind of drift that
+// ends in double billing. Which shape runs is a deployment decision, not a code one.
+if (process.env.SCRAPE_WORKER_DRAIN === "true") {
+    const { waitUntilDrained } = await import("./drain")
+    const { getScrapeQueue, closeScrapeQueue } = await import("../queues/scrape_queue")
+
+    console.log("[drain] started in drain mode - will exit once the queue is empty")
+    const result = await waitUntilDrained(getScrapeQueue())
+    await closeScrapeQueue()
+
+    // A timeout is not a crash, but it should be visible to whatever scheduled this run.
+    if (!result.drained) {
+        console.warn("[drain] exiting with jobs still queued; the next scheduled run will pick them up")
+    }
+    await shutdown()
+}
