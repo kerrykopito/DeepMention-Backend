@@ -1,14 +1,53 @@
-import { defineRailway, project, service } from "railway/iac";
+import { defineRailway, preserve, project, service } from "railway/iac";
 
 // Config as Code (railway.json) is deprecated and, more to the point, Railway does not read it
 // for services created after the cutover - scrape-worker is one of those. This file is the only
 // thing that configures the service.
 //
-// Variables are deliberately NOT declared here. They include the database password and the API
-// keys, and this file is committed to the repository. They are set on the service itself.
+// Every variable the service needs has to appear here, because this file is authoritative:
+// `railway config apply` deletes anything it does not declare. Leaving them out - which this
+// file used to do, to keep secrets out of the repository - meant a plan that quietly proposed
+// destroying all eleven, the database URL and the API keys among them.
+//
+// preserve() is the way to have both: the name is declared so it survives an apply, and the
+// value stays only on the service and never enters source control. The settings that are not
+// secret are declared literally instead, which also puts them under review - WORKER_KIND in
+// particular decides whether this container drains and exits or runs forever, and it used to
+// exist only in the dashboard where nothing could verify it.
 export default defineRailway(() => {
     const scrapeWorker = service("scrape-worker", {
         replicas: { sfo: 1 },
+
+        variables: {
+            DATABASE_URL: preserve(),
+            REDIS_URL: preserve(),
+            BRIGHT_DATA_API_KEY: preserve(),
+            GEMINI_API_KEY: preserve(),
+            GROQ_API_KEY: preserve(),
+
+            // Selects the drain shape in docker-entrypoint.worker.sh, whose default is the
+            // always-on worker - so losing this value turns the cron job into a service that
+            // never stops billing.
+            WORKER_KIND: "drain",
+
+            // Never fabricate an answer with Gemini when a scrape fails. The guard reads
+            // `!== "true"`, so this is belt and braces rather than the only protection.
+            SCRAPER_API_FALLBACK_ENABLED: "false",
+
+            // One run's time budget. A drain that hits it exits non-zero, so an incomplete
+            // sweep is visible rather than silent.
+            SCRAPE_DRAIN_MAX_MS: "900000",
+
+            // Jobs spend their time waiting on Bright Data rather than on CPU - a single job
+            // takes 32-75s and uses almost none - so concurrency multiplies throughput almost
+            // linearly. BullMQ's own limiter (10 per 60s) is the real ceiling above this.
+            SCRAPE_WORKER_CONCURRENCY: "5",
+
+            NODE_ENV: "production",
+
+            // Supabase's CA, baked into the image, used to verify the database certificate.
+            DB_SSL_CA_PATH: "./certs/prod-ca-2021.crt",
+        },
 
         // The same image that Cloud Build produces for Cloud Run, so the two platforms cannot
         // drift apart. WORKER_KIND=drain is what selects the exit-when-empty behaviour.
@@ -29,12 +68,14 @@ export default defineRailway(() => {
             // which silently turns a scheduled job back into an always-on service.
             restartPolicyType: "NEVER",
 
-            // A hard ceiling on what one run can cost. The worker needs roughly 300-450 MB
-            // (Node plus the Prisma engine), so 512 MB leaves headroom without paying for a
-            // gigabyte that sits unused.
+            // A hard ceiling on what one run can cost. Node plus the Prisma engine needs
+            // roughly 300-450 MB at rest, and each concurrent job holds a scraped answer on
+            // top of that. Railway bills memory per second, so a gigabyte for twenty minutes
+            // costs less than half a gigabyte for the hour and three quarters the same queue
+            // takes at concurrency 1 - the run simply finishes sooner.
             limitOverride: {
                 containers: {
-                    memoryBytes: 536870912,
+                    memoryBytes: 1073741824,
                 },
             },
         },
