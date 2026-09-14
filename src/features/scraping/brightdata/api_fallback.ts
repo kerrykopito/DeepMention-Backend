@@ -8,7 +8,12 @@ export async function runApiFallback(
     geo: string,
     reason: string
 ): Promise<UiScrapeResult> {
-    if (process.env.SCRAPER_API_FALLBACK_ENABLED === "false") {
+    // Allow-list, deliberately. This used to read `=== "false"`, which meant that any runtime
+    // without the variable - a new environment, a cloned service, a local `npm run worker:scrape`
+    // - silently fabricated answers with Gemini and stored them as if they had been scraped. Two
+    // of the first three answers in production were invented that way. Fabricating data is now
+    // something a runtime has to ask for explicitly; forgetting the variable fails safe.
+    if (process.env.SCRAPER_API_FALLBACK_ENABLED !== "true") {
         return {
             engine,
             prompt,

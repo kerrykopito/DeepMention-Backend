@@ -363,16 +363,18 @@ if (process.env.PORT) {
     })
 }
 
-async function shutdown() {
+async function shutdown(exitCode = 0) {
     console.log("[worker] Shutting down gracefully...")
     await worker.close()
     if (_cacheRedis) await _cacheRedis.quit()
     await prisma.$disconnect()
-    process.exit(0)
+    process.exit(exitCode)
 }
 
-process.on("SIGINT", shutdown)
-process.on("SIGTERM", shutdown)
+// Wrapped rather than passed directly: a signal handler is called with the signal name, which
+// would otherwise arrive as the exit code and turn a clean SIGTERM into a non-zero exit.
+process.on("SIGINT", () => shutdown(0))
+process.on("SIGTERM", () => shutdown(0))
 
 // Drain mode: process whatever is queued, then exit, instead of staying up waiting for more.
 //
@@ -387,9 +389,15 @@ if (process.env.SCRAPE_WORKER_DRAIN === "true") {
     const result = await waitUntilDrained(getScrapeQueue())
     await closeScrapeQueue()
 
-    // A timeout is not a crash, but it should be visible to whatever scheduled this run.
+    // A timeout is not a crash, but it has to be visible to whatever scheduled this run, and the
+    // only channel a scheduler reads is the exit code. Exiting 0 here is how 90 jobs sat unconsumed
+    // for two days behind a deployment that Railway kept reporting as healthy.
     if (!result.drained) {
-        console.warn("[drain] exiting with jobs still queued; the next scheduled run will pick them up")
+        console.warn(
+            `[drain] exiting with ${result.reason}: jobs are still queued after ` +
+            `${Math.round(result.elapsedMs / 1000)}s. The next scheduled run will pick them up.`
+        )
+        await shutdown(1)
     }
     await shutdown()
 }
