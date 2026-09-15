@@ -1,7 +1,24 @@
+import { Prisma } from "@prisma/client"
 import prisma from "../../lib/prisma"
 import { enrichSource } from "./source_enrichment_service"
 import { buildChatWhere } from "../dashboard/dashboard_service"
 import type { DashboardFilters } from "../dashboard/dashboard_service"
+
+// A project's rollups are bounded by how many distinct domains and URLs it has, not by how
+// many Source rows exist, but nothing stops a project from accumulating both. These caps
+// keep the worst case inside a serverless function's memory; a report that needs more rows
+// than this is not a report anyone reads, it is an export.
+const MAX_DOMAIN_ROWS = 1000
+const MAX_GAP_URL_ROWS = 2000
+const MAX_TREND_DAYS = 400
+
+// getSourceTrend and getSourceGaps used to read a project's entire history with no date
+// window at all, which at a realistic year is ~400k Source rows pulled into one function.
+// Nothing in this file establishes a default window - every other function only narrows by
+// date when the caller passes filters.days - so this takes the longest range the UI's own
+// time-range dropdown offers. It is a deliberate behaviour change: anything older than this
+// no longer contributes to the trend chart or the gap list.
+const DEFAULT_HISTORY_DAYS = 90
 
 export type SourcePage<T> = {
     items: T[]
@@ -29,111 +46,275 @@ function matchesSearch(value: string, search?: string) {
     return !needle || value.toLowerCase().includes(needle)
 }
 
-export async function getTopSources(project_id: string, filters: DashboardFilters = {}) {
-    const chats = await prisma.chat.findMany({
-        where: { ...buildChatWhere(project_id, filters), run: { project_id } },
-        select: {
-            id: true,
-            sources: {
-                select: {
-                    domain: true,
-                    source_type: true,
-                    is_cited: true,
-                },
-            },
-        },
-    })
+// Every rollup below joins Source to its Chat, and a Chat is only in scope once it has been
+// through the project/date/model/geo/search filters. These joins give the raw queries the
+// aliases buildChatWhereSql writes against.
+const CHAT_SCOPE_JOINS = Prisma.sql`
+    JOIN "Prompt" p ON p.id = c.prompt_id
+    JOIN "Run" r ON r.id = c.run_id
+`
 
-    const totalChats = chats.length
-    if (totalChats === 0) return []
+// buildChatWhere() in dashboard_service.ts is the single definition of what "the chats this
+// dashboard is looking at" means, and it is shared with the rest of the product. The rollups
+// here run inside Postgres, so that predicate has to exist as SQL as well, and this mirrors
+// it clause for clause over the aliases above. It is deliberately literal rather than
+// clever: a raw query that quietly drops one filter would mix another period's or another
+// prompt's numbers into an answer that still looks plausible, which is a worse bug than the
+// slow version this replaces. The scratchpad harness snapshot_sources.mts asserts, for every
+// filter and every project, that this predicate and buildChatWhere select the same Chat rows,
+// so the mirror is checked rather than trusted.
+//
+// Every value is interpolated through the tagged template, which parameterises it. Nothing
+// here is ever concatenated into the SQL text.
+function buildChatWhereSql(project_id: string, filters: DashboardFilters): Prisma.Sql {
+    // where.prompt is { project_id } and stays scoped to the project even when a prompt
+    // filter replaces it, so the project condition is unconditional.
+    const conditions: Prisma.Sql[] = [Prisma.sql`p.project_id = ${project_id}`]
 
-    const sourceMap = new Map<string, { count: number, type: string, totalCitations: number }>()
-
-    for (const chat of chats) {
-        const uniqueDomains = new Set(chat.sources.map(s => s.domain))
-        
-        for (const domain of uniqueDomains) {
-            const sourceInfoList = chat.sources.filter(s => s.domain === domain)
-            const citationsInChat = sourceInfoList.filter(s => s.is_cited).length
-            const type = sourceInfoList[0]?.source_type || 'OTHER'
-
-            const existing = sourceMap.get(domain) || { count: 0, type, totalCitations: 0 }
-            
-            sourceMap.set(domain, { 
-                count: existing.count + 1, 
-                type,
-                totalCitations: existing.totalCitations + citationsInChat
-            })
-        }
+    if (filters.days) {
+        const since = new Date(Date.now() - filters.days * 24 * 60 * 60 * 1000)
+        // created_at is TIMESTAMP(3) without a zone holding UTC, and casting an ISO string
+        // to `timestamp` makes Postgres read the same wall clock the JS Date encodes. Passing
+        // the Date object instead would leave the interpretation up to the driver.
+        conditions.push(Prisma.sql`c.created_at >= ${since.toISOString()}::timestamp`)
     }
 
-    const topSources = Array.from(sourceMap.entries()).map(([domain, data]) => ({
-        domain,
-        source_type: data.type,
-        used_percentage: (data.count / totalChats) * 100,
-        avg_citations: data.totalCitations / data.count
-    })).sort((a, b) => b.used_percentage - a.used_percentage)
+    if (filters.model && filters.model !== 'all') {
+        conditions.push(Prisma.sql`c.ai_model ILIKE '%' || ${filters.model} || '%'`)
+    }
 
-    return topSources
+    if (filters.country && filters.country !== 'all') {
+        conditions.push(Prisma.sql`(
+            c.geo_country_code = ${filters.country}
+            OR c.geo_country_name ILIKE ${filters.country}
+        )`)
+    }
+
+    if (typeof filters.mentioned === 'boolean') {
+        conditions.push(Prisma.sql`c.brand_mentioned = ${filters.mentioned}`)
+    }
+
+    if (filters.cited === true) {
+        conditions.push(Prisma.sql`EXISTS (SELECT 1 FROM "Source" cited WHERE cited.chat_id = c.id AND cited.is_cited)`)
+    } else if (filters.cited === false) {
+        conditions.push(Prisma.sql`NOT EXISTS (SELECT 1 FROM "Source" cited WHERE cited.chat_id = c.id AND cited.is_cited)`)
+    }
+
+    if (filters.topic && filters.topic !== 'all') {
+        conditions.push(Prisma.sql`p.topic = ${filters.topic}`)
+    }
+
+    if (filters.intent && filters.intent !== 'all') {
+        conditions.push(Prisma.sql`p.type = ${filters.intent}`)
+    }
+
+    if (filters.tag && filters.tag !== 'all') {
+        conditions.push(Prisma.sql`${filters.tag} = ANY(p.tags)`)
+    }
+
+    if (filters.prompt_id) {
+        conditions.push(Prisma.sql`p.id = ${filters.prompt_id}`)
+    }
+
+    const q = filters.q?.trim()
+    if (q) {
+        // ILIKE with the needle wrapped in literal percent signs is what Prisma's
+        // `contains` + `mode: 'insensitive'` compiles to. Prisma does not escape % or _ in
+        // the needle either, so this does not escape them: matching the quirk is what keeps
+        // search results identical.
+        conditions.push(Prisma.sql`(
+            c.raw_response ILIKE '%' || ${q} || '%'
+            OR p.text ILIKE '%' || ${q} || '%'
+            OR EXISTS (SELECT 1 FROM "BrandMention" qm WHERE qm.chat_id = c.id AND qm.brand_name ILIKE '%' || ${q} || '%')
+            OR EXISTS (SELECT 1 FROM "Source" qd WHERE qd.chat_id = c.id AND qd.domain ILIKE '%' || ${q} || '%')
+            OR EXISTS (SELECT 1 FROM "Source" qt WHERE qt.chat_id = c.id AND qt.title ILIKE '%' || ${q} || '%')
+        )`)
+    }
+
+    return Prisma.join(conditions, " AND ")
+}
+
+// If DashboardFilters grows a field, this stops compiling until buildChatWhereSql above has
+// a clause for it. It is a reminder, not the guarantee - the guarantee is the harness.
+const SQL_MIRRORED_FILTERS: Record<keyof DashboardFilters, true> = {
+    days: true, model: true, topic: true, tag: true, prompt_id: true,
+    q: true, country: true, intent: true, mentioned: true, cited: true,
+}
+void SQL_MIRRORED_FILTERS
+
+// getTopSources and getDomaEUReport both narrow by buildChatWhere *and* by run.project_id.
+// getSourceTrend and getSourceGaps deliberately do not - they only scope by the run - so
+// they build their own predicate instead of calling this.
+function chatScopeWhereSql(project_id: string, filters: DashboardFilters): Prisma.Sql {
+    return Prisma.sql`${buildChatWhereSql(project_id, filters)} AND r.project_id = ${project_id}`
+}
+
+// The denominator of every percentage on this page is the number of chats in scope,
+// including chats that produced no sources at all, so it cannot be derived from the grouped
+// source query without inflating every rate.
+async function countScopedChats(where: Prisma.Sql) {
+    const [row] = await prisma.$queryRaw<{ total: number }[]>`
+        SELECT COUNT(*)::int AS total
+        FROM "Chat" c
+        ${CHAT_SCOPE_JOINS}
+        WHERE ${where}
+    `
+    return row?.total ?? 0
+}
+
+/**
+ * Exported for the scratchpad verification harness only. It counts the chats the raw-SQL
+ * predicate selects so the harness can compare that against prisma.chat.count() through
+ * buildChatWhere, for every filter combination. Keeping the comparison runnable is what
+ * stops the SQL mirror from drifting the next time a filter is added.
+ */
+export async function __chatFilterParityProbe(project_id: string, filters: DashboardFilters = {}) {
+    return countScopedChats(chatScopeWhereSql(project_id, filters))
+}
+
+// All four reports used to take "the first row wins" from whatever order Postgres happened
+// to hand Prisma's nested read: source_type, the url_types list, the order of equally ranked
+// domains, and every gap tie-break came out of physical row order. That is not something to
+// rebuild a report on, and it drifts the moment the enrichment worker updates a row. This
+// replaces it with the ordering this codebase already treats as canonical for a chat's
+// sources - see the sources orderBy in getRecentChats - applied to chats in creation order.
+// It is deterministic, and on production data it reproduces the order the old code produced.
+//
+// Every query below numbers its rows with this and then aggregates the numbering away, so a
+// domain's "first" row means the same thing everywhere.
+const SOURCE_SCAN_ORDER = Prisma.sql`
+    c.created_at ASC, c.id ASC,
+    s.is_cited DESC, s.answer_position ASC, s.source_position ASC, s.created_at ASC, s.id ASC
+`
+
+type DomainIdentity = { source_type: string, url_types: string[] }
+
+// source_type is the first row's, url_types is in first-seen order - the same shape the old
+// Map-and-Set code produced. Grouping to (domain, url_type, source_type) keeps the number of
+// rows crossing the wire proportional to the number of domains, not to Source rows.
+async function fetchDomainIdentities(where: Prisma.Sql, domains: string[]) {
+    const identities = new Map<string, DomainIdentity>()
+    if (domains.length === 0) return identities
+
+    const rows = await prisma.$queryRaw<{ domain: string, url_type: string, source_type: string }[]>`
+        WITH ranked AS (
+            SELECT s.domain AS domain,
+                   s.url_type::text AS url_type,
+                   s.source_type::text AS source_type,
+                   ROW_NUMBER() OVER (ORDER BY ${SOURCE_SCAN_ORDER}) AS rn
+            FROM "Source" s
+            JOIN "Chat" c ON c.id = s.chat_id
+            ${CHAT_SCOPE_JOINS}
+            WHERE ${where} AND s.domain = ANY(${domains}::text[])
+        )
+        SELECT domain, url_type, source_type
+        FROM ranked
+        GROUP BY domain, url_type, source_type
+        ORDER BY domain ASC, MIN(rn) ASC
+    `
+
+    for (const row of rows) {
+        const existing = identities.get(row.domain)
+        if (!existing) {
+            identities.set(row.domain, { source_type: row.source_type, url_types: [row.url_type] })
+            continue
+        }
+        if (!existing.url_types.includes(row.url_type)) existing.url_types.push(row.url_type)
+    }
+
+    return identities
+}
+
+export async function getTopSources(project_id: string, filters: DashboardFilters = {}) {
+    const where = chatScopeWhereSql(project_id, filters)
+    const totalChats = await countScopedChats(where)
+    if (totalChats === 0) return []
+
+    // This used to read every Source row of every matching chat and then run a filter() per
+    // domain per chat, which is quadratic in the sources of a single chat and linear in the
+    // whole table. The two numbers it was deriving are a COUNT(DISTINCT chat_id) and a
+    // COUNT(*) FILTER (WHERE is_cited), both of which Postgres answers without sending a row
+    // per source. Prisma's groupBy cannot express the distinct count - _count is not
+    // distinct-aware - so this is raw.
+    const rows = await prisma.$queryRaw<{ domain: string, chat_count: number, citation_count: number }[]>`
+        WITH ranked AS (
+            SELECT s.domain AS domain,
+                   s.chat_id AS chat_id,
+                   s.is_cited AS is_cited,
+                   ROW_NUMBER() OVER (ORDER BY ${SOURCE_SCAN_ORDER}) AS rn
+            FROM "Source" s
+            JOIN "Chat" c ON c.id = s.chat_id
+            ${CHAT_SCOPE_JOINS}
+            WHERE ${where}
+        )
+        SELECT domain,
+               COUNT(DISTINCT chat_id)::int AS chat_count,
+               (COUNT(*) FILTER (WHERE is_cited))::int AS citation_count
+        FROM ranked
+        GROUP BY domain
+        ORDER BY chat_count DESC, MIN(rn) ASC
+        LIMIT ${MAX_DOMAIN_ROWS}
+    `
+
+    const identities = await fetchDomainIdentities(where, rows.map(row => row.domain))
+
+    // The divisions stay in JavaScript on purpose: Postgres would hand back a Decimal for
+    // them, which does not round the way the double this endpoint has always returned does.
+    return rows.map(row => ({
+        domain: row.domain,
+        source_type: identities.get(row.domain)?.source_type ?? 'OTHER',
+        used_percentage: (row.chat_count / totalChats) * 100,
+        avg_citations: row.citation_count / row.chat_count
+    })).sort((a, b) => b.used_percentage - a.used_percentage)
 }
 
 export async function getDomaEUReport(project_id: string, filters: DashboardFilters = {}) {
-    const chats = await prisma.chat.findMany({
-        where: { ...buildChatWhere(project_id, filters), run: { project_id } },
-        select: {
-            id: true,
-            sources: {
-                select: {
-                    domain: true,
-                    source_type: true,
-                    url_type: true,
-                    url: true,
-                    is_cited: true,
-                },
-            },
-        },
-    })
-
-    const totalChats = chats.length
+    const where = chatScopeWhereSql(project_id, filters)
+    const totalChats = await countScopedChats(where)
     if (totalChats === 0) return []
 
-    const domainMap = new Map<string, {
-        retrievedChats: Set<string>
-        citationCount: number
-        sourceType: string
-        urlTypes: Set<string>
-        urls: Set<string>
-    }>()
+    // Three of the four numbers per domain are distinct counts, which is exactly what the
+    // Set-of-chat-ids and Set-of-urls in the old JavaScript were emulating, one row at a time.
+    const rows = await prisma.$queryRaw<{
+        domain: string
+        retrieval_count: number
+        citation_count: number
+        unique_urls: number
+    }[]>`
+        WITH ranked AS (
+            SELECT s.domain AS domain,
+                   s.chat_id AS chat_id,
+                   s.url AS url,
+                   s.is_cited AS is_cited,
+                   ROW_NUMBER() OVER (ORDER BY ${SOURCE_SCAN_ORDER}) AS rn
+            FROM "Source" s
+            JOIN "Chat" c ON c.id = s.chat_id
+            ${CHAT_SCOPE_JOINS}
+            WHERE ${where}
+        )
+        SELECT domain,
+               COUNT(DISTINCT chat_id)::int AS retrieval_count,
+               (COUNT(*) FILTER (WHERE is_cited))::int AS citation_count,
+               COUNT(DISTINCT url)::int AS unique_urls
+        FROM ranked
+        GROUP BY domain
+        ORDER BY retrieval_count DESC, MIN(rn) ASC
+        LIMIT ${MAX_DOMAIN_ROWS}
+    `
 
-    for (const chat of chats) {
-        for (const source of chat.sources) {
-            const existing = domainMap.get(source.domain) ?? {
-                retrievedChats: new Set<string>(),
-                citationCount: 0,
-                sourceType: source.source_type,
-                urlTypes: new Set<string>(),
-                urls: new Set<string>()
-            }
+    const identities = await fetchDomainIdentities(where, rows.map(row => row.domain))
 
-            existing.retrievedChats.add(chat.id)
-            existing.urls.add(source.url)
-            existing.urlTypes.add(source.url_type)
-            if (source.is_cited) existing.citationCount += 1
-            domainMap.set(source.domain, existing)
-        }
-    }
-
-    return Array.from(domainMap.entries()).map(([domain, data]) => {
-        const retrievalCount = data.retrievedChats.size
+    return rows.map(row => {
+        const identity = identities.get(row.domain)
         return {
-            domain,
-            source_type: data.sourceType,
-            url_types: Array.from(data.urlTypes),
-            unique_urls: data.urls.size,
-            retrieval_count: retrievalCount,
-            retrieval_rate: (retrievalCount / totalChats) * 100,
-            citation_count: data.citationCount,
-            citation_rate: retrievalCount > 0 ? (data.citationCount / retrievalCount) * 100 : 0
+            domain: row.domain,
+            source_type: identity?.source_type ?? 'OTHER',
+            url_types: identity?.url_types ?? [],
+            unique_urls: row.unique_urls,
+            retrieval_count: row.retrieval_count,
+            retrieval_rate: (row.retrieval_count / totalChats) * 100,
+            citation_count: row.citation_count,
+            citation_rate: row.retrieval_count > 0 ? (row.citation_count / row.retrieval_count) * 100 : 0
         }
     }).sort((a, b) => b.retrieval_rate - a.retrieval_rate)
 }
@@ -378,71 +559,81 @@ function safeDomain(url: string) {
 }
 
 export async function getSourceTrend(project_id: string) {
-    const chats = await prisma.chat.findMany({
-        where: { run: { project_id } },
-        select: {
-            id: true,
-            created_at: true,
-            sources: {
-                select: {
-                    domain: true,
-                    source_type: true,
-                    is_cited: true,
-                },
-            },
-        },
-        orderBy: { created_at: "asc" }
-    })
+    const since = new Date(Date.now() - DEFAULT_HISTORY_DAYS * 24 * 60 * 60 * 1000).toISOString()
+    // This function scopes by the run only, never by buildChatWhere - the controller passes
+    // no filters - so it builds its own predicate rather than reusing chatScopeWhereSql.
+    const scope = Prisma.sql`r.project_id = ${project_id} AND c.created_at >= ${since}::timestamp`
 
-    if (chats.length === 0) return []
+    // The day buckets have to come off Chat, not Source: total_chats counts every chat that
+    // ran that day, and a day whose chats happened to cite none of the top domains still has
+    // to appear in the series with an empty domains array.
+    //
+    // first_chat_at comes back as text rather than a timestamp because the driver decides how
+    // to interpret a zoneless timestamp, and the label below depends on getting the exact
+    // instant. Formatting it as UTC text and re-parsing removes the driver from that decision.
+    const days = await prisma.$queryRaw<{ date: string, total_chats: number, first_chat_at: string }[]>`
+        SELECT to_char(c.created_at, 'YYYY-MM-DD') AS date,
+               COUNT(*)::int AS total_chats,
+               to_char(MIN(c.created_at), 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS first_chat_at
+        FROM "Chat" c
+        JOIN "Run" r ON r.id = c.run_id
+        WHERE ${scope}
+        GROUP BY 1
+        ORDER BY 1 ASC
+        LIMIT ${MAX_TREND_DAYS}
+    `
+    if (days.length === 0) return []
 
+    // The top-six selection stays unwindowed. Windowing it too would change which domains
+    // the chart tracks rather than just which days it covers, and now that the domain report
+    // is a Postgres rollup, reading all of history to rank domains costs one grouped scan.
     const topDomains = await getDomaEUReport(project_id)
-    const domainSet = new Set(topDomains.slice(0, 6).map(source => source.domain))
-    const dayMap = new Map<string, {
-        date: string
-        label: string
-        total_chats: number
-        domains: Map<string, { domain: string, source_type: string, chats: Set<string>, citations: number }>
-    }>()
+    const domainTypes = new Map(topDomains.slice(0, 6).map(source => [source.domain, source.source_type]))
+    const domains = Array.from(domainTypes.keys())
 
-    for (const chat of chats) {
-        const date = chat.created_at.toISOString().slice(0, 10)
-        const existingDay = dayMap.get(date) ?? {
-            date,
-            label: chat.created_at.toLocaleDateString("en-US", { month: "short", day: "numeric" }),
-            total_chats: 0,
-            domains: new Map<string, { domain: string, source_type: string, chats: Set<string>, citations: number }>()
-        }
-        existingDay.total_chats += 1
+    const perDay = domains.length === 0
+        ? []
+        : await prisma.$queryRaw<{ date: string, domain: string, chat_count: number, citation_count: number }[]>`
+            WITH ranked AS (
+                SELECT to_char(c.created_at, 'YYYY-MM-DD') AS date,
+                       s.domain AS domain,
+                       s.chat_id AS chat_id,
+                       s.is_cited AS is_cited,
+                       ROW_NUMBER() OVER (ORDER BY ${SOURCE_SCAN_ORDER}) AS rn
+                FROM "Source" s
+                JOIN "Chat" c ON c.id = s.chat_id
+                JOIN "Run" r ON r.id = c.run_id
+                WHERE ${scope} AND s.domain = ANY(${domains}::text[])
+            )
+            SELECT date,
+                   domain,
+                   COUNT(DISTINCT chat_id)::int AS chat_count,
+                   (COUNT(*) FILTER (WHERE is_cited))::int AS citation_count
+            FROM ranked
+            GROUP BY date, domain
+            ORDER BY date ASC, MIN(rn) ASC
+        `
 
-        const uniqueSourceDomains = new Set<string>()
-        for (const source of chat.sources) {
-            if (!domainSet.has(source.domain) || uniqueSourceDomains.has(source.domain)) continue
-            uniqueSourceDomains.add(source.domain)
-
-            const domainData = existingDay.domains.get(source.domain) ?? {
-                domain: source.domain,
-                source_type: source.source_type,
-                chats: new Set<string>(),
-                citations: 0
-            }
-            domainData.chats.add(chat.id)
-            domainData.citations += chat.sources.filter(item => item.domain === source.domain && item.is_cited).length
-            existingDay.domains.set(source.domain, domainData)
-        }
-
-        dayMap.set(date, existingDay)
+    const byDate = new Map<string, typeof perDay>()
+    for (const row of perDay) {
+        const bucket = byDate.get(row.date) ?? []
+        bucket.push(row)
+        byDate.set(row.date, bucket)
     }
 
-    return Array.from(dayMap.values()).map(day => ({
+    return days.map(day => ({
         date: day.date,
-        label: day.label,
+        // The label is still formatted in JavaScript because it always has been: date is the
+        // UTC day but toLocaleDateString renders in the server's timezone, so the two can name
+        // different days for a chat near midnight. Postgres cannot reproduce that mismatch,
+        // and reproducing it is the point.
+        label: new Date(day.first_chat_at).toLocaleDateString("en-US", { month: "short", day: "numeric" }),
         total_chats: day.total_chats,
-        domains: Array.from(day.domains.values()).map(domain => ({
-            domain: domain.domain,
-            source_type: domain.source_type,
-            usage_percentage: day.total_chats > 0 ? (domain.chats.size / day.total_chats) * 100 : 0,
-            citation_count: domain.citations
+        domains: (byDate.get(day.date) ?? []).map(row => ({
+            domain: row.domain,
+            source_type: domainTypes.get(row.domain) ?? 'OTHER',
+            usage_percentage: day.total_chats > 0 ? (row.chat_count / day.total_chats) * 100 : 0,
+            citation_count: row.citation_count
         }))
     }))
 }
@@ -453,43 +644,38 @@ export async function getSourceGaps(project_id: string) {
         include: { competitors: true }
     })
 
-    const sources = await prisma.source.findMany({
-        where: {
-            chat: {
-                run: { project_id }
-            }
-        },
-        select: {
-            url: true,
-            domain: true,
-            title: true,
-            source_type: true,
-            url_type: true,
-            platform: true,
-            subreddit: true,
-            is_cited: true,
-            mentioned_brands: true,
-            source_url_content: {
-                select: {
-                    title: true,
-                    mentioned_brands: true,
-                },
-            },
-            chat: {
-                select: {
-                    brand_mentions: {
-                        select: {
-                            brand_name: true,
-                        },
-                    },
-                }
-            }
-        }
-    })
+    const since = new Date(Date.now() - DEFAULT_HISTORY_DAYS * 24 * 60 * 60 * 1000).toISOString()
+    // Like getSourceTrend, this scopes by the run only - the controller passes no filters.
+    const scope = Prisma.sql`r.project_id = ${project_id} AND c.created_at >= ${since}::timestamp`
 
-    const brandName = project.brand_name.toLowerCase()
-    const trackedCompetitors = new Set(project.competitors.map(competitor => competitor.name.toLowerCase()))
-    const gapMap = new Map<string, {
+    // Step one narrows the whole Source table to the URLs worth scoring. retrievals is the
+    // dominant term in gap_score, so ranking by it keeps the URLs most likely to reach the
+    // top of the list; see the note on MAX_GAP_URL_ROWS for what that cap costs.
+    const counts = await prisma.$queryRaw<{ url: string, retrievals: number, citations: number }[]>`
+        WITH ranked AS (
+            SELECT s.url AS url,
+                   s.is_cited AS is_cited,
+                   ROW_NUMBER() OVER (ORDER BY ${SOURCE_SCAN_ORDER}) AS rn
+            FROM "Source" s
+            JOIN "Chat" c ON c.id = s.chat_id
+            JOIN "Run" r ON r.id = c.run_id
+            WHERE ${scope}
+        )
+        SELECT url,
+               COUNT(*)::int AS retrievals,
+               (COUNT(*) FILTER (WHERE is_cited))::int AS citations
+        FROM ranked
+        GROUP BY url
+        ORDER BY retrievals DESC, MIN(rn) ASC
+        LIMIT ${MAX_GAP_URL_ROWS}
+    `
+    if (counts.length === 0) return []
+    const urls = counts.map(row => row.url)
+
+    // The identity columns come from whichever source row was seen first for a URL, which is
+    // what the old first-write-wins gapMap entry did. Grouping rather than taking one row also
+    // yields every distinct title a URL has appeared under, which brand inference needs.
+    const identityRows = await prisma.$queryRaw<{
         url: string
         domain: string
         title: string | null
@@ -497,85 +683,149 @@ export async function getSourceGaps(project_id: string) {
         url_type: string
         platform: string | null
         subreddit: string | null
-        retrievals: number
-        citations: number
-        mentionedOwnBrand: boolean
-        mentionedCompetitors: Set<string>
-        trackedCompetitors: Set<string>
+    }[]>`
+        WITH ranked AS (
+            SELECT s.url AS url,
+                   s.domain AS domain,
+                   COALESCE(s.title, suc.title) AS title,
+                   s.source_type::text AS source_type,
+                   s.url_type::text AS url_type,
+                   s.platform AS platform,
+                   s.subreddit AS subreddit,
+                   ROW_NUMBER() OVER (ORDER BY ${SOURCE_SCAN_ORDER}) AS rn
+            FROM "Source" s
+            JOIN "Chat" c ON c.id = s.chat_id
+            JOIN "Run" r ON r.id = c.run_id
+            LEFT JOIN "SourceUrlContent" suc ON suc.id = s.source_url_content_id
+            WHERE ${scope} AND s.url = ANY(${urls}::text[])
+        )
+        SELECT url, domain, title, source_type, url_type, platform, subreddit
+        FROM ranked
+        GROUP BY url, domain, title, source_type, url_type, platform, subreddit
+        ORDER BY url ASC, MIN(rn) ASC
+    `
+
+    // mentioned_brands is a JSONB array. Only string elements counted before, so the
+    // jsonb_typeof guard keeps a malformed entry from turning into the text "null" or "42".
+    const sourceBrandRows = await prisma.$queryRaw<{ url: string, brand: string }[]>`
+        WITH ranked AS (
+            SELECT s.url AS url,
+                   e.value #>> '{}' AS brand,
+                   ROW_NUMBER() OVER (ORDER BY ${SOURCE_SCAN_ORDER}, e.ord ASC) AS rn
+            FROM "Source" s
+            JOIN "Chat" c ON c.id = s.chat_id
+            JOIN "Run" r ON r.id = c.run_id
+            CROSS JOIN LATERAL jsonb_array_elements(
+                CASE WHEN jsonb_typeof(s.mentioned_brands) = 'array' THEN s.mentioned_brands ELSE '[]'::jsonb END
+            ) WITH ORDINALITY AS e(value, ord)
+            WHERE ${scope} AND s.url = ANY(${urls}::text[]) AND jsonb_typeof(e.value) = 'string'
+        )
+        SELECT url, brand
+        FROM ranked
+        GROUP BY url, brand
+        ORDER BY url ASC, MIN(rn) ASC
+    `
+
+    // Brands the answer itself mentioned, for every chat that retrieved this URL.
+    const answerBrandRows = await prisma.$queryRaw<{ url: string, brand: string }[]>`
+        WITH ranked AS (
+            SELECT s.url AS url,
+                   bm.brand_name AS brand,
+                   ROW_NUMBER() OVER (ORDER BY ${SOURCE_SCAN_ORDER}, bm.position ASC, bm.created_at ASC, bm.id ASC) AS rn
+            FROM "Source" s
+            JOIN "Chat" c ON c.id = s.chat_id
+            JOIN "Run" r ON r.id = c.run_id
+            JOIN "BrandMention" bm ON bm.chat_id = c.id
+            WHERE ${scope} AND s.url = ANY(${urls}::text[])
+        )
+        SELECT url, brand
+        FROM ranked
+        GROUP BY url, brand
+        ORDER BY url ASC, MIN(rn) ASC
+    `
+
+    const identities = new Map<string, {
+        domain: string
+        title: string | null
+        source_type: string
+        url_type: string
+        platform: string | null
+        subreddit: string | null
+        titles: string[]
     }>()
-
-    for (const source of sources) {
-        const existing = gapMap.get(source.url) ?? {
-            url: source.url,
-            domain: source.domain,
-            title: source.title ?? source.source_url_content?.title ?? null,
-            source_type: source.source_type,
-            url_type: source.url_type,
-            platform: source.platform,
-            subreddit: source.subreddit,
-            retrievals: 0,
-            citations: 0,
-            mentionedOwnBrand: false,
-            mentionedCompetitors: new Set<string>(),
-            trackedCompetitors: new Set<string>()
+    for (const row of identityRows) {
+        const existing = identities.get(row.url)
+        if (!existing) {
+            identities.set(row.url, { ...row, titles: row.title ? [row.title] : [] })
+            continue
         }
+        if (row.title && !existing.titles.includes(row.title)) existing.titles.push(row.title)
+    }
 
-        existing.retrievals += 1
-        if (source.is_cited) existing.citations += 1
+    const groupByUrl = (rows: { url: string, brand: string }[]) => {
+        const grouped = new Map<string, string[]>()
+        for (const row of rows) {
+            const existing = grouped.get(row.url)
+            if (existing) existing.push(row.brand)
+            else grouped.set(row.url, [row.brand])
+        }
+        return grouped
+    }
+    const sourceBrandsByUrl = groupByUrl(sourceBrandRows)
+    const answerBrandsByUrl = groupByUrl(answerBrandRows)
 
-        const sourceBrands = Array.isArray(source.mentioned_brands)
-            ? source.mentioned_brands.filter((brand): brand is string => typeof brand === "string")
-            : []
+    const brandName = project.brand_name.toLowerCase()
+    const trackedCompetitors = new Set(project.competitors.map(competitor => competitor.name.toLowerCase()))
+
+    return counts.flatMap(row => {
+        const identity = identities.get(row.url)
+        if (!identity) return []
+
+        // Brand matching is string work that Postgres has no business doing, so it still runs
+        // in JavaScript - but once per URL over the union of that URL's rows, instead of once
+        // per row. The one semantic consequence is that the "use the source's own brands, fall
+        // back to inference" choice is now made for the URL rather than for each row.
+        const sourceBrands = sourceBrandsByUrl.get(row.url) ?? []
+        const answerBrands = answerBrandsByUrl.get(row.url) ?? []
         const candidateBrands = [
             project.brand_name,
             ...project.competitors.map(competitor => competitor.name),
-            ...source.chat.brand_mentions.map(mention => mention.brand_name)
+            ...answerBrands
         ]
-        const inferredBrands = inferBrandsFromSourceIdentity(source.url, source.domain, source.title ?? source.source_url_content?.title ?? null, candidateBrands)
+        const titleVariants = identity.titles.length > 0 ? identity.titles : [null]
+        const inferredBrands = [...new Set(titleVariants.flatMap(title =>
+            inferBrandsFromSourceIdentity(row.url, identity.domain, title, candidateBrands)
+        ))]
         const sourceLevelBrands = sourceBrands.length > 0 ? sourceBrands : inferredBrands
-        const answerCompetitorBrands = source.chat.brand_mentions
-            .map(mention => mention.brand_name)
-            .filter(brand => brand.toLowerCase() !== brandName)
+        const answerCompetitorBrands = answerBrands.filter(brand => brand.toLowerCase() !== brandName)
         const competitorBrands = sourceLevelBrands.length > 0 ? sourceLevelBrands : answerCompetitorBrands
 
-        for (const brand of sourceLevelBrands) {
-            const normalized = brand.toLowerCase()
-            if (normalized === brandName) {
-                existing.mentionedOwnBrand = true
-            }
-        }
-
+        const mentionedOwnBrand = sourceLevelBrands.some(brand => brand.toLowerCase() === brandName)
+        const competitorHits: string[] = []
+        const trackedHits: string[] = []
         for (const brand of competitorBrands) {
             const normalized = brand.toLowerCase()
-            if (normalized !== brandName) {
-                existing.mentionedCompetitors.add(brand)
-                if (trackedCompetitors.has(normalized)) {
-                    existing.trackedCompetitors.add(brand)
-                }
-            }
+            if (normalized === brandName) continue
+            if (!competitorHits.includes(brand)) competitorHits.push(brand)
+            if (trackedCompetitors.has(normalized) && !trackedHits.includes(brand)) trackedHits.push(brand)
         }
 
-        gapMap.set(source.url, existing)
-    }
-
-    return Array.from(gapMap.values()).map(url => {
-        const competitorHits = Array.from(url.mentionedCompetitors)
-        return {
-            url: url.url,
-            domain: url.domain,
-            title: url.title,
-            source_type: url.source_type,
-            url_type: url.url_type,
-            platform: url.platform,
-            subreddit: url.subreddit,
-            retrievals: url.retrievals,
-            citations: url.citations,
-            mentioned_own_brand: url.mentionedOwnBrand,
+        return [{
+            url: row.url,
+            domain: identity.domain,
+            title: identity.title,
+            source_type: identity.source_type,
+            url_type: identity.url_type,
+            platform: identity.platform,
+            subreddit: identity.subreddit,
+            retrievals: row.retrievals,
+            citations: row.citations,
+            mentioned_own_brand: mentionedOwnBrand,
             mentioned_competitors: competitorHits,
-            tracked_competitors: Array.from(url.trackedCompetitors),
-            gap_score: !url.mentionedOwnBrand && competitorHits.length > 0 ? url.retrievals * competitorHits.length : 0,
-            suggested_action: buildSuggestedAction(url, url.mentionedOwnBrand, competitorHits)
-        }
+            tracked_competitors: trackedHits,
+            gap_score: !mentionedOwnBrand && competitorHits.length > 0 ? row.retrievals * competitorHits.length : 0,
+            suggested_action: buildSuggestedAction(identity, mentionedOwnBrand, competitorHits)
+        }]
     }).filter(gap => gap.gap_score > 0).sort((a, b) => b.gap_score - a.gap_score)
 }
 

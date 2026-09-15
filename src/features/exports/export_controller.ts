@@ -28,7 +28,15 @@ export async function downloadCsvExportController(req: Request, res: Response): 
         const filters = parseFilters(req.query)
 
         await assertProjectAccess(project_id, userId)
-        // PAYG: exports always allowed — credits deducted by credit service
+        // The export entitlement is checked here rather than assumed. `canExport` was imported
+        // and never called, next to a comment claiming exports were always allowed and that
+        // credits covered them — neither of which was true: no export path charges anything,
+        // so FREE's declared `exports: "none"` was the only rule and nothing applied it.
+        const exportAccess = await canExport(userId)
+        if (!exportAccess.allowed) {
+            res.status(403).json({ error: exportAccess.reason ?? "Your plan does not include exports." })
+            return
+        }
 
         if (format === "json") {
             if (resource !== "overview") {

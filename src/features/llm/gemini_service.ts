@@ -6,7 +6,7 @@ import { buildAnalysisSystemPrompt, buildAnalysisUserPrompt, type AnalysisResult
 import { buildBrandResearchSystemPrompt, buildBrandResearchUserPrompt, type BrandResearchResult } from '../../prompts/research_prompts'
 import { generateWithBedrockGateway, hasBedrockGateway } from './bedrock_gateway_service'
 import { isEligibleCompetitorEntity, normalizeEntityDomain, sanitizeDiscoveredBrandName } from '../brands/brand_entity_policy'
-import { normalizeStrictBrandName } from '../brands/strict_brand_matcher'
+import { containsStrictBrandName, normalizeStrictBrandName } from '../brands/strict_brand_matcher'
 import { analyzeUiAnswerWithKimi } from './analysis/kimi_analysis_service'
 
 // Built on first use, not at import: this module is pulled in by the route graph, and on a
@@ -25,16 +25,6 @@ const GROQ_ANALYSIS_MODEL = 'qwen/qwen3.8-27b'
 
 // Analysis runs on Gemini (then Groq) when no Bedrock credential is present. Logged once per
 // process rather than per analysed answer, which would be thousands of lines in a scrape run.
-let bedrockFallbackWarned = false
-function warnBedrockFallbackOnce() {
-    if (bedrockFallbackWarned) return
-    bedrockFallbackWarned = true
-    console.warn(
-        'Bedrock gateway not configured; analysing with Gemini instead of Kimi. '
-        + 'Set KIMI_ANALYSIS_REQUIRED=true to treat this as a fatal error instead.'
-    )
-}
-
 export async function embedText(text: string): Promise<number[]> {
     const cleanText = text.replace(/\s+/g, ' ').trim()
     if (!cleanText) {
@@ -148,6 +138,12 @@ export async function summarizeBrandResearch(
     }
 }
 
+// The analyser for every scraped answer. Gemini by default: it is the cheapest tier of the
+// provider this project already depends on for brand research and prompt generation, so there
+// is one bill, one key to rotate and one failure mode — and it is the credential the
+// production worker actually carries.
+const ANALYSIS_PROVIDER = (process.env.ANALYSIS_PROVIDER ?? "gemini").trim().toLowerCase()
+
 export async function analyzeResponse(
     raw_response: string,
     ai_model: string,
@@ -158,7 +154,23 @@ export async function analyzeResponse(
     const systemPrompt = buildAnalysisSystemPrompt()
     const userPrompt = buildAnalysisUserPrompt(raw_response, brand_name, brand_url, citations)
 
-    if (hasBedrockGateway()) {
+    // Which model decides brand_mentioned, brand_position and sentiment_score is a data
+    // question, not a deployment accident. This used to read `if (hasBedrockGateway())`, so
+    // the analyser was whichever model the runtime happened to hold a key for: Kimi on a
+    // laptop with an AWS token, Gemini on the Railway worker, which declares only
+    // GEMINI_API_KEY and GROQ_API_KEY. The same scraped answer therefore produced different
+    // numbers in different places, with nothing on the Chat row to say which.
+    //
+    // The provider is now stated, and defaults to Gemini because that is the key production
+    // actually has. Set ANALYSIS_PROVIDER=bedrock to use Kimi, and it will fail loudly rather
+    // than downgrade if the gateway is missing.
+    if (ANALYSIS_PROVIDER === "bedrock") {
+        if (!hasBedrockGateway()) {
+            throw new Error(
+                "ANALYSIS_PROVIDER=bedrock but no Bedrock gateway credential is configured on this runtime. "
+                + "Configure one, or unset ANALYSIS_PROVIDER to analyse with Gemini."
+            )
+        }
         const parsed = await analyzeUiAnswerWithKimi({
             uiAnswer: raw_response,
             sourceModel: ai_model,
@@ -169,14 +181,15 @@ export async function analyzeResponse(
         return { ...normalizeAnalysisResult(parsed, raw_response, brand_name, brand_url, citations), ai_model }
     }
 
+    // Kept for runtimes that already set it: an explicit demand for Kimi is still honoured,
+    // and still fatal when the gateway is absent.
     if (process.env.KIMI_ANALYSIS_REQUIRED?.trim().toLowerCase() === "true") {
         throw new Error(
-            "Kimi analysis is required but the Bedrock gateway is not configured. "
-            + "Configure a supported Bedrock gateway credential on this runtime."
+            "KIMI_ANALYSIS_REQUIRED=true but the Bedrock gateway is not configured. "
+            + "Configure a supported Bedrock gateway credential, or set ANALYSIS_PROVIDER=gemini."
         )
     }
 
-    warnBedrockFallbackOnce()
     try {
         const result = await getModel().generateContent({
             contents: [{ role: 'user', parts: [{ text: systemPrompt }, { text: userPrompt }] }],
@@ -249,7 +262,10 @@ function parseJson<T>(raw: string | undefined | null): T {
     }
 }
 
-function normalizeAnalysisResult(
+// Exported for brand_mention_evidence.test.ts. The evidence rule below is the one place a
+// model claim is accepted or refused, so it is worth testing directly rather than through a
+// live analysis call.
+export function normalizeAnalysisResult(
     analysis: AnalysisResult,
     rawResponse: string,
     brandName: string,
@@ -263,7 +279,43 @@ function normalizeAnalysisResult(
     const semanticTrackedMention = normalizedBrandMentions.find(
         mention => mention.entity_type === "TRACKED_BRAND"
     )
-    const brandMentioned = Boolean(analysis.brand_mentioned || semanticTrackedMention)
+
+    // Whether the tracked brand is present is a claim about a text we hold, so it is checked
+    // against that text rather than taken on the model's word. This used to be
+    // `analysis.brand_mentioned || semanticTrackedMention` — an OR, so the deterministic
+    // matcher could only ever *add* a mention and never withhold one. A model that invented an
+    // appearance produced a BrandMention row indistinguishable from a real one, and visibility
+    // is the number the whole product reports.
+    //
+    // Evidence is deliberately broader than an exact string match on the brand name: the
+    // answer may name the brand through the variant the model resolved (matched_brand_name),
+    // or link it without naming it, which a citation to the brand's own domain establishes.
+    const matchedName = analysis.matched_brand_name?.trim() || null
+    const brandDomain = safeDomain(brandUrl)
+    const namedInAnswer = containsStrictBrandName(rawResponse, brandName)
+        || Boolean(matchedName && containsStrictBrandName(rawResponse, matchedName))
+    const citedInAnswer = Boolean(brandDomain && citations.some(citation => {
+        const domain = citation.domain || safeDomain(citation.url) || ""
+        return domain.endsWith(brandDomain)
+    }))
+    const hasBrandEvidence = namedInAnswer || citedInAnswer
+
+    const claimedMention = Boolean(analysis.brand_mentioned || semanticTrackedMention)
+    const brandMentioned = claimedMention && hasBrandEvidence
+
+    if (claimedMention && !hasBrandEvidence) {
+        // Dropped rather than stored unverified: a TRACKED_BRAND row is what visibility counts,
+        // and there is no column to mark one as doubtful. Nothing is lost — the answer text is
+        // on the Chat row, so the call can be revisited by re-analysing it.
+        console.warn(
+            `[analysis] discarding unverifiable brand mention: model reported "${brandName}" `
+            + `but the answer neither names it nor cites ${brandDomain ?? "its domain"}`
+        )
+        const unverifiedIndex = normalizedBrandMentions.findIndex(
+            mention => mention.entity_type === "TRACKED_BRAND"
+        )
+        if (unverifiedIndex >= 0) normalizedBrandMentions.splice(unverifiedIndex, 1)
+    }
 
     if (brandMentioned && !semanticTrackedMention) {
         normalizedBrandMentions.push({
@@ -273,7 +325,7 @@ function normalizeAnalysisResult(
             entity_type: "TRACKED_BRAND",
             position: analysis.brand_position ?? null,
             sentiment_score: analysis.sentiment_score ?? null,
-            evidence: analysis.matched_brand_name ?? null,
+            evidence: matchedName ?? (namedInAnswer ? brandName : brandDomain),
         })
     }
     const trackedMention = normalizedBrandMentions.find(

@@ -1,4 +1,5 @@
 import { Request, Response } from 'express'
+import { resolveErrorResponse } from '../../lib/http_error'
 import { getDiscoveredBrands, addCompetitor, getTrackedCompetitors, removeCompetitor } from './brand_service'
 import { assertCompetitorAccess, assertCompetitorMutationAccess, assertProjectAccess, assertProjectMutationAccess } from '../projects/project_access'
 import type { AuthenticatedRequest } from '../../middleware/auth'
@@ -50,15 +51,15 @@ export const addCompetitorController = async (req: Request, res: Response): Prom
         const competitor = await addCompetitor({ project_id, name, url, user_id: userId })
         res.status(201).json(competitor)
     } catch (error) {
-        if (error instanceof Error && error.message === 'PROJECT_NOT_FOUND') {
-            res.status(404).json({ error: 'Project not found' })
-            return
+        // Both branches this replaces decided the status from the message: an exact compare
+        // against 'PROJECT_NOT_FOUND' and, below it, any message containing the word
+        // "competitor" - which answered 403 to what is a plan limit, and would have caught an
+        // unrelated internal error that happened to mention the word.
+        const { status, message, unexpected } = resolveErrorResponse(error, 'Failed to add competitor')
+        if (unexpected) {
+            console.error('[brand_controller:addCompetitor]', error)
         }
-        if (error instanceof Error && error.message.toLowerCase().includes('competitor')) {
-            res.status(403).json({ error: error.message })
-            return
-        }
-        res.status(500).json({ error: 'Failed to add competitor' })
+        res.status(status).json({ error: message })
     }
 }
 

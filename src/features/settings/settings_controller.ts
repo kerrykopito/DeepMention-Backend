@@ -2,6 +2,7 @@ import type { Request, Response } from "express"
 import { z } from "zod"
 import type { AuthenticatedRequest } from "../../middleware/auth"
 import { getSettings, updateAccountType, updatePassword } from "./settings_service"
+import { resolveErrorResponse } from "../../lib/http_error"
 
 const passwordSchema = z.object({
     current_password: z.string().min(1, "Current password is required"),
@@ -22,12 +23,9 @@ export async function getSettingsController(req: Request, res: Response): Promis
 
         res.status(200).json(await getSettings(userId))
     } catch (error) {
-        if (error instanceof Error && error.message === "User not found") {
-            res.status(404).json({ error: error.message })
-            return
-        }
-        console.error("[settings_controller:getSettings]", error)
-        res.status(500).json({ error: "Failed to get settings" })
+        const { status, message, unexpected } = resolveErrorResponse(error, "Failed to get settings")
+        if (unexpected) console.error("[settings_controller:getSettings]", error)
+        res.status(status).json({ error: message })
     }
 }
 
@@ -54,19 +52,11 @@ export async function updatePasswordController(req: Request, res: Response): Pro
 
         res.status(200).json(result)
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to update password"
-        const statusCode =
-            message === "User not found" ? 404 :
-            message === "Current password is incorrect" ? 400 :
-            message === "New password must be different from current password" ? 400 :
-            500
-
-        if (statusCode === 500) {
-            console.error("[settings_controller:updatePassword]", error)
-            res.status(500).json({ error: "Failed to update password" })
-            return
-        }
-        res.status(statusCode).json({ error: message })
+        // Every sentence this ladder compared is now thrown with its own status, so
+        // rewording any of them can no longer turn a 400 into a 500.
+        const { status, message, unexpected } = resolveErrorResponse(error, "Failed to update password")
+        if (unexpected) console.error("[settings_controller:updatePassword]", error)
+        res.status(status).json({ error: message })
     }
 }
 
@@ -80,17 +70,12 @@ export async function updateAccountTypeController(req: Request, res: Response): 
         const { user: { id: userId } } = req as AuthenticatedRequest
         res.status(200).json(await updateAccountType(userId, parsed.data.account_type))
     } catch (error) {
-        const message = error instanceof Error ? error.message : ""
-        if (message === "User not found") {
-            res.status(404).json({ error: message })
-            return
+        // The three sentences this used to compare against now arrive carrying 404 and 409
+        // themselves, so rewording any of them cannot turn it into a server error.
+        const { status, message, unexpected } = resolveErrorResponse(error, "Failed to update account type")
+        if (unexpected) {
+            console.error("[settings_controller:updateAccountType]", error)
         }
-        if (message === "Agency accounts cannot be converted to individual accounts while shared workspace data exists"
-            || message === "Cancel the active individual subscription before converting to an agency account") {
-            res.status(409).json({ error: message })
-            return
-        }
-        console.error("[settings_controller:updateAccountType]", error)
-        res.status(500).json({ error: "Failed to update account type" })
+        res.status(status).json({ error: message })
     }
 }

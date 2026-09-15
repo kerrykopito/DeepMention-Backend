@@ -9,6 +9,10 @@ import { ensureFreeTrialSubscription, getEffectivePlanAccess } from '../subscrip
 import { awardCredits } from '../payments/credits_service'
 import { signupBonusFor } from '../payments/credits_config'
 import jwt from 'jsonwebtoken'
+import { httpError } from '../../lib/http_error'
+
+/** Machine code for the one login failure that is answered with 403 rather than 401. */
+export const EMAIL_NOT_VERIFIED = 'EMAIL_NOT_VERIFIED'
 
 /** A real bcrypt hash of a random value, compared against when no account matches. */
 const TIMING_EQUALISER_HASH = '$2b$10$tH3e8THL4wq4Kb2zqHJ2ouiz8eA6FPwidbQMy89YYe29wBRSL5t4G'
@@ -81,7 +85,7 @@ export async function verifyUserOtp(email: string, otp: string) {
     const user = await prisma.user.findUnique({ where: { email: normalizedEmail } })
 
     if (!user) {
-        throw new Error('User not found')
+        throw httpError(404, 'User not found')
     }
 
     if (user.is_verified) {
@@ -145,13 +149,15 @@ export async function registerUser(input: RegisterInput): Promise<RegisterRespon
 
     // 1. Work email check
     if (!isWorkEmail(email)) {
-        throw new Error('Only work/business email addresses are allowed.')
+        // The status rides along with the error so that register() does not have to spot the
+        // words "work/business" in the sentence to know this is a 422 and not a fault.
+        throw httpError(422, 'Only work/business email addresses are allowed.')
     }
 
     // 2. Duplicate check
     const existing = await prisma.user.findUnique({ where: { email } })
     if (existing?.is_verified) {
-        throw new Error('An account with this email already exists.')
+        throw httpError(409, 'An account with this email already exists.')
     }
 
     // 3. Hash password
@@ -243,7 +249,11 @@ export async function login(input: LoginInput): Promise<LogEUResponse> {
     const accessToken = generateAccessToken(user.id)
     const refreshToken = generateRefreshToken(user.id)
     if (!user.is_verified) {
-        throw new Error("please verify your email")
+        // The wording stays exactly as it was, because EXPECTED_AUTH_ERRORS in the controller
+        // matches it literally. What is new is the code: login answers 403 for this one case
+        // and 401 for every other credential failure, and it now tells them apart by the code
+        // rather than by searching the sentence for "verify your email".
+        throw httpError(403, "please verify your email", EMAIL_NOT_VERIFIED)
     }
     await ensureFreeTrialSubscription(user.id)
     const access = await getEffectivePlanAccess(user.id)

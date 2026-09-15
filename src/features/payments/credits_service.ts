@@ -7,9 +7,10 @@ import type Stripe from "stripe"
 import { resolveFrontendUrl } from "../../lib/env"
 import prisma from "../../lib/prisma"
 import { AccountType, Plan, Prisma, SubscriptionStatus } from "@prisma/client"
-import { CREDIT_ACTIONS, LOW_BALANCE_THRESHOLD, creditPolicyFor, signupBonusFor, getCreditPack, getCustomCreditPack, type CreditAction } from "./credits_config"
+import { LOW_BALANCE_THRESHOLD, creditPolicyFor, signupBonusFor, getCreditPack, getCustomCreditPack } from "./credits_config"
 import { getBillingPlan, type PaidPlan } from "./billing_catalog"
 import { getStripeClient } from "../subscription/stripe_config"
+import { httpError } from "../../lib/http_error"
 
 export async function getBillingAccountContext(userId: string): Promise<{ billingUserId: string; accountType: AccountType }> {
     const user = await prisma.user.findUnique({ where: { id: userId }, select: { account_type: true } })
@@ -39,10 +40,6 @@ export async function getSiteAuditCreditCost(userId: string, maxPages: number): 
     return rates.deep
 }
 
-async function getActionCreditCost(userId: string, action: CreditAction): Promise<number> {
-    return action === "PROMPT_RUN" ? getPromptRunCreditCost(userId) : CREDIT_ACTIONS[action]
-}
-
 export async function expireCreditBuckets(userId: string) {
     const now = new Date()
     const expired = await prisma.creditBucket.findMany({ where: { user_id: userId, amount_remaining: { gt: 0 }, expires_at: { lte: now } }, select: { id: true, amount_remaining: true, source: true } })
@@ -62,6 +59,13 @@ export async function createCreditBucket(userId: string, amount: number, source:
 }
 
 export class InsufficientCreditsError extends Error {
+    // 402 travels on the error so that resolveErrorResponse classifies it without any caller
+    // having to recognise the sentence. Three controllers were testing for
+    // `message.startsWith("Not enough credits")`, which this error has never said - it says
+    // "Insufficient credits: need X, have Y" - so an empty wallet was answered with a 500 and
+    // a generic sentence instead of a 402 telling the user to top up.
+    readonly status = 402
+
     constructor(required: number, available: number) {
         super(`Insufficient credits: need ${required}, have ${available}`)
         this.name = "InsufficientCreditsError"
@@ -79,52 +83,6 @@ export async function getCreditBalance(userId: string): Promise<number> {
         select: { credits_balance: true },
     })
     return user?.credits_balance ?? 0
-}
-
-/**
- * Assert that the user has enough credits for an action.
- * Throws InsufficientCreditsError if not.
- */
-export async function assertCredits(userId: string, action: CreditAction): Promise<void> {
-    const cost    = await getActionCreditCost(userId, action)
-    const balance = await getCreditBalance(userId)
-    if (balance < cost) throw new InsufficientCreditsError(cost, balance)
-}
-
-/**
- * Deduct credits for an action in a single atomic transaction.
- * Returns the new balance.
- */
-export async function deductCredits(
-    userId:      string,
-    action:      CreditAction,
-    description?: string,
-    metadata?:   Record<string, unknown>,
-): Promise<number> {
-    const cost    = await getActionCreditCost(userId, action)
-    const billingUserId = await resolveBillingUserId(userId)
-    const balance = await getCreditBalance(billingUserId)
-
-    if (balance < cost) throw new InsufficientCreditsError(cost, balance)
-
-    const [updatedUser] = await prisma.$transaction([
-        prisma.user.update({
-            where: { id: billingUserId },
-            data:  { credits_balance: { decrement: cost } },
-            select: { credits_balance: true },
-        }),
-        prisma.creditTransaction.create({
-            data: {
-                user_id:     billingUserId,
-                amount:      -cost,
-                action,
-                description: description ?? action,
-                metadata:    metadata ? (metadata as any) : undefined,
-            },
-        }),
-    ])
-
-    return updatedUser.credits_balance
 }
 
 /**
@@ -371,10 +329,10 @@ export async function createCreditPackCheckoutSession(
         : input.custom_credits
             ? getCustomCreditPack(input.custom_credits, accountType)
             : null
-    if (!pack) throw new Error("Invalid credit pack")
+    if (!pack) throw httpError(400, "Invalid credit pack")
 
     const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true } })
-    if (!user) throw new Error("User not found")
+    if (!user) throw httpError(404, "User not found")
 
     const stripe = getStripeClient()
     const frontendUrl = resolveFrontendUrl()

@@ -2,6 +2,7 @@ import type Stripe from "stripe"
 import prisma from "../../lib/prisma"
 import { processFailedInvoice, processPaidInvoice, getInvoiceSubscriptionId } from "./billing_invoice_service"
 import { getStripeClient, getStripeId } from "./stripe_config"
+import { httpError } from "../../lib/http_error"
 import { syncSubscriptionFromStripe } from "./subscription_service"
 import { awardCreditPackFromCheckoutSession } from "../payments/credits_service"
 
@@ -59,10 +60,22 @@ async function processEvent(event: Stripe.Event) {
 
 export async function handleStripeWebhook(rawBody: Buffer | string, signature: string | undefined) {
     const secret = process.env.STRIPE_WEBHOOK_SECRET
-    if (!secret) throw new Error("STRIPE_WEBHOOK_SECRET is required")
-    if (!signature) throw new Error("Missing Stripe signature")
+    // A missing secret is really a deployment fault rather than a bad request, but the
+    // controller has always answered 400 to it and this change is a reclassification of
+    // errors, not of statuses: the 400 is preserved deliberately rather than by accident.
+    if (!secret) throw httpError(400, "STRIPE_WEBHOOK_SECRET is required")
+    if (!signature) throw httpError(400, "Missing Stripe signature")
 
-    const event = getStripeClient().webhooks.constructEvent(rawBody, signature, secret)
+    let event: Stripe.Event
+    try {
+        event = getStripeClient().webhooks.constructEvent(rawBody, signature, secret)
+    } catch (error) {
+        // constructEvent rejects a body whose signature does not verify, which is the
+        // sender's problem. Tagging it here is what lets the controller answer "Invalid
+        // webhook signature" without searching the message for the word "signature" - and
+        // without confusing it with a failure from processing the event further down.
+        throw httpError(400, error instanceof Error ? error.message : "Invalid webhook signature")
+    }
     if (!(await beginEvent(event))) return { received: true, duplicate: true, event_type: event.type }
 
     try {

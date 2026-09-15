@@ -208,11 +208,11 @@ export async function getPublicPortalData(token: string, passcode?: string) {
                 },
             },
         }),
-        prisma.seoDomaEUResearchOverviewSnapshot.findFirst({
+        prisma.seoDomainResearchOverviewSnapshot.findFirst({
             where: { domain: share.project.brand_url },
             orderBy: { created_at: "desc" },
         }),
-        prisma.seoDomaEUResearchKeywordSnapshot.findFirst({
+        prisma.seoDomainResearchKeywordSnapshot.findFirst({
             where: { domain: share.project.brand_url },
             orderBy: { created_at: "desc" },
         }),

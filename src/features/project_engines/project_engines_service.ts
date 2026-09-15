@@ -1,6 +1,8 @@
 import { Engine } from "@prisma/client"
 import prisma from "../../lib/prisma"
 import { getEffectivePlanAccess } from "../subscription/entitlements"
+import { PlanLimitError, TRIAL_ENGINE_LIMIT, planLabel } from "../subscription/plan_limits"
+import { httpError } from "../../lib/http_error"
 import { assertProjectMutationAccess } from "../projects/project_access"
 import {
     DEFAULT_PROJECT_ENGINES,
@@ -9,17 +11,40 @@ import {
     normalizeProjectEngines,
 } from "./project_engine_policy"
 
-// PAYG: all 5 engines available to every user \u2014 only validate non-empty
+// Validates the selection and holds it to the account's engine allowance: the trial cap while
+// a trial is running, the plan's own cap afterwards.
 export async function assertCanUseProjectEngines(userId: string, rawEngines: unknown) {
     const engines = normalizeProjectEngines(rawEngines)
 
+    // An empty selection is a malformed request, not a server fault, so it carries its own
+    // 400. The status travels with the error because the two controllers that call this used
+    // to recognise it by the word "Select" appearing in the sentence.
     if (engines.length === 0) {
-        throw new Error("Select at least one AI engine.")
+        throw httpError(400, "Select at least one AI engine.")
     }
 
     const access = await getEffectivePlanAccess(userId)
-    if (access.trial.active && engines.length > 3) {
-        throw new Error("Your free trial includes 3 AI engines. Add a plan or credits to unlock all engines.")
+    // A trial engine cap is a product limit, so it is the same kind of rejection as the
+    // workspace cap and travels the same way. Reaching the scrape endpoint it used to be
+    // answered with a 500, since that controller looked for the words "plan can track".
+    if (access.trial.active && engines.length > TRIAL_ENGINE_LIMIT) {
+        throw new PlanLimitError(`Your free trial includes ${TRIAL_ENGINE_LIMIT} AI engines. Add a plan or credits to unlock all engines.`)
+    }
+
+    // Outside a trial the plan's own engine allowance applies. Nothing enforced this before,
+    // so FREE's declared three was advertised by the quota endpoint and never checked.
+    //
+    // Unlike workspaces, prompts and competitors, credits do not lift this one. Those three
+    // are quantities of tracking the account pays to run, so a wallet can fund more of them;
+    // engine coverage is what distinguishes the tiers from each other, and letting a top-up
+    // buy it would mean no reason to hold a plan at all.
+    if (!access.trial.active) {
+        const engineLimit = getEngineLimitForPlan(access.effective_plan)
+        if (engines.length > engineLimit) {
+            throw new PlanLimitError(
+                `Your ${planLabel(access.effective_plan)} plan can track ${engineLimit} AI engine${engineLimit === 1 ? "" : "s"}. Upgrade to track more.`,
+            )
+        }
     }
 
     return engines

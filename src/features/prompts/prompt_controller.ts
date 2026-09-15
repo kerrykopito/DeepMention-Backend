@@ -7,10 +7,15 @@ import {
     toggleGeoVariant, getGeoVisibilityStats, getGeoCountryByName,
 } from './prompt_service'
 import { discoverPromptCandidates } from './prompt_discovery_service'
-import { assertProjectAccess, assertProjectMutationAccess, assertPromptAccess } from '../projects/project_access'
+// assertPromptMutationAccess was used six times in this file and imported nowhere, so every
+// call threw ReferenceError and was swallowed into a 500: activate, deactivate and all four
+// geo-variant endpoints were dead. It failed closed, so nothing was exposed — but nothing
+// worked either, and without a type-check step there was nothing to say so.
+import { assertProjectAccess, assertProjectMutationAccess, assertPromptAccess, assertPromptMutationAccess } from '../projects/project_access'
 import type { AuthenticatedRequest } from '../../middleware/auth'
 import { assertCanCreatePrompts } from '../subscription/subscription_service'
 import prisma from '../../lib/prisma'
+import { resolveErrorResponse } from '../../lib/http_error'
 
 const createTopicSchema = z.object({
     name: z.string().trim().min(2, 'Topic name must be at least 2 characters').max(80, 'Topic name is too long'),
@@ -174,15 +179,15 @@ export const createPromptController = async (req: Request, res: Response): Promi
 
         res.status(201).json({ success: true, prompt })
     } catch (error) {
-        if (error instanceof Error && error.message === 'PROJECT_NOT_FOUND') {
-            res.status(404).json({ error: 'Project not found' })
-            return
+        // Looking for the word "plan" answered 500 to "Your free trial has ended. Please
+        // upgrade or add credits to add more prompts." - a real product limit whose sentence
+        // does not contain it. Both trial limits are PlanLimitErrors now, so the user is told
+        // what actually stopped them.
+        const { status, message, unexpected } = resolveErrorResponse(error, 'Failed to create prompt')
+        if (unexpected) {
+            console.error("[prompt_controller:createPrompt]", error)
         }
-        if (error instanceof Error && error.message.includes('plan')) {
-            res.status(400).json({ error: error.message })
-            return
-        }
-        res.status(500).json({ error: 'Failed to create prompt' })
+        res.status(status).json({ error: message })
     }
 }
 
@@ -264,13 +269,15 @@ export const activatePromptController = async (req: Request, res: Response): Pro
         const prompt = await activatePrompt(prompt_id)
         res.status(200).json(prompt)
     } catch (error) {
-        const message = error instanceof Error ? error.message : ''
-        if (message.includes('plan') || message.includes('remaining')) {
-            res.status(400).json({ error: message })
-            return
+        // Same trial limits as creation, and the same fix. The "remaining" half of the old
+        // test matched nothing anything on this path has ever thrown, and the access checks
+        // above throw a not-found code and a read-only sentence that matched neither half -
+        // so a caller without write access was told the server had failed.
+        const { status, message, unexpected } = resolveErrorResponse(error, 'Failed to activate prompt')
+        if (unexpected) {
+            console.error("[prompt_controller:activatePrompt]", error)
         }
-        console.error("[prompt_controller:activatePrompt]", error)
-        res.status(500).json({ error: 'Failed to activate prompt' })
+        res.status(status).json({ error: message })
     }
 }
 
@@ -358,7 +365,7 @@ export const deleteGeoVariantController = async (req: Request, res: Response): P
             res.status(400).json({ error: 'variant_id is required' })
             return
         }
-        const variant = await prisma.promptGeoVariant.findUnique({ where: { id: variant_id } })
+        const variant = await prisma.geoPromptVariant.findUnique({ where: { id: variant_id } })
         if (!variant) {
             res.status(404).json({ error: 'Variant not found' })
             return
@@ -382,7 +389,7 @@ export const toggleGeoVariantController = async (req: Request, res: Response): P
             res.status(400).json({ error: 'variant_id is required' })
             return
         }
-        const existingVariant = await prisma.promptGeoVariant.findUnique({ where: { id: variant_id } })
+        const existingVariant = await prisma.geoPromptVariant.findUnique({ where: { id: variant_id } })
         if (!existingVariant) {
             res.status(404).json({ error: 'Variant not found' })
             return

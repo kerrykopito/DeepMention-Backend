@@ -6,6 +6,11 @@ import { enqueueSourceEnrichment } from "../../queues/source_enrichment_queue"
 import { normalizeAnswerBlocks } from "./answer_block_normalizer"
 import { normalizeEntityDomain } from "../brands/brand_entity_policy"
 
+// The source table is a top-N list, but the query used to return every domain a project has
+// ever cited: a year of one project is ~400k source rows over thousands of domains, all of it
+// serialised to the browser to render a handful of bars.
+const TOP_SOURCES_LIMIT = 100
+
 export interface DashboardFilters {
     days?: number
     model?: string
@@ -102,6 +107,75 @@ export function buildChatWhere(project_id: string, filters: DashboardFilters): P
     return where
 }
 
+/**
+ * SQL twin of buildChatWhere, for the aggregations Prisma cannot express
+ * (COUNT(DISTINCT ...), date_trunc bucketing, "oldest half of the chats").
+ *
+ * Every branch here mirrors one branch of buildChatWhere and they must be edited in
+ * lockstep: a raw query that quietly drops a filter returns numbers that look plausible
+ * and are wrong, which is worse than a slow query. The caller is responsible for aliasing
+ * Chat as "c" and Prompt as "p"; the fragment is a bare boolean expression so it can be
+ * dropped into any WHERE clause.
+ */
+function buildChatWhereSql(project_id: string, filters: DashboardFilters): Prisma.Sql {
+    const conditions: Prisma.Sql[] = [Prisma.sql`p.project_id = ${project_id}`]
+
+    if (filters.days) {
+        // created_at is "timestamp without time zone" holding UTC. A JS Date would be
+        // serialised by the driver in the client's local zone and silently shift the
+        // window by the offset, so pass the UTC wall time and cast it explicitly.
+        const since = new Date(Date.now() - filters.days * 24 * 60 * 60 * 1000).toISOString()
+        conditions.push(Prisma.sql`c.created_at >= ${since}::timestamp`)
+    }
+
+    if (filters.model && filters.model !== 'all') {
+        conditions.push(Prisma.sql`c.ai_model ILIKE '%' || ${filters.model} || '%'`)
+    }
+
+    if (filters.country && filters.country !== 'all') {
+        conditions.push(Prisma.sql`(c.geo_country_code = ${filters.country} OR c.geo_country_name ILIKE ${filters.country})`)
+    }
+
+    if (typeof filters.mentioned === 'boolean') {
+        conditions.push(Prisma.sql`c.brand_mentioned = ${filters.mentioned}`)
+    }
+
+    if (filters.cited === true) {
+        conditions.push(Prisma.sql`EXISTS (SELECT 1 FROM "Source" cited WHERE cited.chat_id = c.id AND cited.is_cited)`)
+    } else if (filters.cited === false) {
+        conditions.push(Prisma.sql`NOT EXISTS (SELECT 1 FROM "Source" cited WHERE cited.chat_id = c.id AND cited.is_cited)`)
+    }
+
+    if (filters.topic && filters.topic !== 'all') {
+        conditions.push(Prisma.sql`p.topic = ${filters.topic}`)
+    }
+
+    if (filters.intent && filters.intent !== 'all') {
+        conditions.push(Prisma.sql`p.type = ${filters.intent}`)
+    }
+
+    if (filters.tag && filters.tag !== 'all') {
+        conditions.push(Prisma.sql`${filters.tag}::text = ANY(p.tags)`)
+    }
+
+    if (filters.prompt_id) {
+        conditions.push(Prisma.sql`p.id = ${filters.prompt_id}`)
+    }
+
+    const q = filters.q?.trim()
+    if (q) {
+        conditions.push(Prisma.sql`(
+            c.raw_response ILIKE '%' || ${q} || '%'
+            OR p.text ILIKE '%' || ${q} || '%'
+            OR EXISTS (SELECT 1 FROM "BrandMention" hit WHERE hit.chat_id = c.id AND hit.brand_name ILIKE '%' || ${q} || '%')
+            OR EXISTS (SELECT 1 FROM "Source" hit WHERE hit.chat_id = c.id AND hit.domain ILIKE '%' || ${q} || '%')
+            OR EXISTS (SELECT 1 FROM "Source" hit WHERE hit.chat_id = c.id AND hit.title ILIKE '%' || ${q} || '%')
+        )`)
+    }
+
+    return Prisma.join(conditions, ' AND ')
+}
+
 function previousPeriodFilters(filters: DashboardFilters): DashboardFilters | null {
     if (!filters.days) return null
 
@@ -128,29 +202,75 @@ function deltaValue(current: number | null, previous: number | null, lowerIsBett
     return lowerIsBetter ? -diff : diff
 }
 
-function splitAllTimeChats<T extends { created_at: Date }>(chats: T[]) {
-    const sorted = [...chats].sort((a, b) => a.created_at.getTime() - b.created_at.getTime())
-    const midpoint = Math.floor(sorted.length / 2)
+interface OwnBrandStats {
+    visibility: number | null
+    avg_position: number | null
+    avg_sentiment: number | null
+}
+
+/**
+ * Own-brand headline numbers, grouped by brand_mentioned so one round trip yields both the
+ * denominator (every matching chat) and the numerator (the mentioning ones). Position and
+ * sentiment are averaged over the mentioning chats only, and SQL AVG skips NULLs, which is
+ * what the old in-memory version did by filtering before it divided.
+ */
+async function ownBrandStats(where: Prisma.ChatWhereInput): Promise<{ total: number } & OwnBrandStats> {
+    const groups = await prisma.chat.groupBy({
+        by: ['brand_mentioned'],
+        where,
+        _count: { _all: true },
+        _avg: { brand_position: true, sentiment_score: true },
+    })
+
+    const total = groups.reduce((acc, group) => acc + group._count._all, 0)
+    if (total === 0) {
+        return { total: 0, visibility: null, avg_position: null, avg_sentiment: null }
+    }
+
+    const mentioned = groups.find(group => group.brand_mentioned)
     return {
-        previous: sorted.slice(0, midpoint),
-        current: sorted.slice(midpoint)
+        total,
+        visibility: ((mentioned?._count._all ?? 0) / total) * 100,
+        avg_position: mentioned?._avg.brand_position ?? null,
+        avg_sentiment: mentioned?._avg.sentiment_score ?? null
     }
 }
 
-function aggregateOwnBrand(chats: Array<{ brand_mentioned: boolean; brand_position: number | null; sentiment_score: number | null }>) {
-    const totalChats = chats.length
-    if (totalChats === 0) {
+/**
+ * Without a date filter the dashboard compares the newer half of the history against the
+ * older half, so "previous" is the oldest floor(n/2) chats. Prisma can neither apply a row
+ * limit before aggregating nor count a filtered subset, hence the raw form.
+ */
+async function previousAllTimeBrandStats(project_id: string, filters: DashboardFilters, midpoint: number): Promise<OwnBrandStats> {
+    if (midpoint <= 0) {
         return { visibility: null, avg_position: null, avg_sentiment: null }
     }
 
-    const brandMentions = chats.filter(c => c.brand_mentioned)
-    const positionChats = brandMentions.filter(c => c.brand_position !== null)
-    const sentimentChats = brandMentions.filter(c => c.sentiment_score !== null)
+    const chatWhereSql = buildChatWhereSql(project_id, filters)
+    const [row] = await prisma.$queryRaw<Array<{ total: number, mentioned: number, avg_position: number | null, avg_sentiment: number | null }>>`
+        SELECT
+            COUNT(*)::int AS total,
+            (COUNT(*) FILTER (WHERE oldest.brand_mentioned))::int AS mentioned,
+            (AVG(oldest.brand_position) FILTER (WHERE oldest.brand_mentioned))::float8 AS avg_position,
+            (AVG(oldest.sentiment_score) FILTER (WHERE oldest.brand_mentioned))::float8 AS avg_sentiment
+        FROM (
+            SELECT c.brand_mentioned, c.brand_position, c.sentiment_score
+            FROM "Chat" c
+            JOIN "Prompt" p ON p.id = c.prompt_id
+            WHERE ${chatWhereSql}
+            ORDER BY c.created_at ASC
+            LIMIT ${midpoint}
+        ) oldest
+    `
+
+    if (!row || row.total === 0) {
+        return { visibility: null, avg_position: null, avg_sentiment: null }
+    }
 
     return {
-        visibility: (brandMentions.length / totalChats) * 100,
-        avg_position: positionChats.length > 0 ? positionChats.reduce((acc, c) => acc + (c.brand_position ?? 0), 0) / positionChats.length : null,
-        avg_sentiment: sentimentChats.length > 0 ? sentimentChats.reduce((acc, c) => acc + (c.sentiment_score ?? 0), 0) / sentimentChats.length : null
+        visibility: (row.mentioned / row.total) * 100,
+        avg_position: row.avg_position,
+        avg_sentiment: row.avg_sentiment
     }
 }
 
@@ -163,10 +283,13 @@ export async function getFilterOptions(project_id: string) {
     const topics = Array.from(new Set(prompts.map(p => p.topic).filter(Boolean)))
     const tags = Array.from(new Set(prompts.flatMap(p => p.tags).filter(Boolean)))
     const intents = Array.from(new Set(prompts.map(p => p.type).filter(Boolean)))
-    const chats = await prisma.chat.findMany({
+    // The country list is at most a handful of rows, but it used to be distilled from every
+    // chat the project has ever produced. groupBy is the same set of pairs, collapsed by
+    // Postgres instead of by streaming the history into this process.
+    const chats = await prisma.chat.groupBy({
+        by: ['geo_country_code', 'geo_country_name'],
         where: { prompt: { project_id } },
-        select: { geo_country_code: true, geo_country_name: true },
-        distinct: ['geo_country_code', 'geo_country_name'],
+        orderBy: [{ geo_country_code: 'asc' }, { geo_country_name: 'asc' }],
     })
     const countries = chats
         .map(chat => ({ value: chat.geo_country_code || chat.geo_country_name || '', label: chat.geo_country_name || chat.geo_country_code || '' }))
@@ -376,91 +499,70 @@ function safeDomain(url: string | null | undefined) {
 export async function getDashboardData({ project_id, filters }: { project_id: string, filters?: DashboardFilters }) {
     const chatWhere = buildChatWhere(project_id, filters || {})
 
-    const chats = await prisma.chat.findMany({
-        where: chatWhere,
-        select: {
-            created_at: true,
-            brand_mentioned: true,
-            brand_position: true,
-            sentiment_score: true,
-            brand_mentions: {
-                select: {
-                    brand_name: true,
-                    position: true,
-                    sentiment_score: true,
-                },
-            },
-            sources: {
-                select: {
-                    domain: true,
-                    source_type: true,
-                },
-            },
-        }
-    })
-
-    const totalChats = chats.length
+    const brandStats = await ownBrandStats(chatWhere)
+    const totalChats = brandStats.total
     if (totalChats === 0) return null
 
-    const brandStats = aggregateOwnBrand(chats)
-    let previousBrandStats: ReturnType<typeof aggregateOwnBrand> | null = null
-
+    let previousBrandStats: OwnBrandStats
     if (filters?.days) {
         const previousFilters = previousPeriodFilters(filters) ?? {}
         const previousWhere = buildChatWhere(project_id, previousFilters)
         previousWhere.created_at = previousPeriodDateWhere(filters)
-        const previousChats = await prisma.chat.findMany({
-            where: previousWhere,
-            select: {
-                brand_mentioned: true,
-                brand_position: true,
-                sentiment_score: true,
-            },
-        })
-        previousBrandStats = aggregateOwnBrand(previousChats)
+        previousBrandStats = await ownBrandStats(previousWhere)
     } else {
-        const split = splitAllTimeChats(chats)
-        previousBrandStats = aggregateOwnBrand(split.previous)
-        const recentStats = aggregateOwnBrand(split.current)
-        brandStats.visibility = brandStats.visibility ?? recentStats.visibility
+        previousBrandStats = await previousAllTimeBrandStats(project_id, filters ?? {}, Math.floor(totalChats / 2))
     }
 
-    const competitorMap = new Map<string, { count: number, totalPosition: number, totalSentiment: number }>()
+    // Sums rather than averages: the table has always divided by every mention of the brand,
+    // counting a mention with no position as a zero, which is not what SQL AVG does.
+    //
+    // Brands tied on visibility are ordered by summed position, which inside a tied group is
+    // the same ordering as the average position shown in the row, so the better-placed brand
+    // comes first. The in-memory version left ties in whatever order Postgres happened to
+    // return the rows in; the table now has a total order, which is also what makes it safe
+    // to compare two runs.
+    const competitorGroups = await prisma.brandMention.groupBy({
+        by: ['brand_name'],
+        where: { chat: chatWhere },
+        _count: { _all: true },
+        _sum: { position: true, sentiment_score: true },
+        orderBy: [{ _count: { brand_name: 'desc' } }, { _sum: { position: 'asc' } }, { brand_name: 'asc' }],
+    })
 
-    for (const chat of chats) {
-        for (const mention of chat.brand_mentions) {
-            const existing = competitorMap.get(mention.brand_name) || { count: 0, totalPosition: 0, totalSentiment: 0 }
-            competitorMap.set(mention.brand_name, {
-                count: existing.count + 1,
-                totalPosition: existing.totalPosition + (mention.position || 0),
-                totalSentiment: existing.totalSentiment + (mention.sentiment_score || 0)
-            })
-        }
-    }
+    const competitors = competitorGroups.map(group => ({
+        brand_name: group.brand_name,
+        visibility: (group._count._all / totalChats) * 100,
+        avg_position: (group._sum.position ?? 0) / group._count._all,
+        avg_sentiment: (group._sum.sentiment_score ?? 0) / group._count._all
+    }))
 
-    const competitors = Array.from(competitorMap.entries()).map(([name, data]) => ({
-        brand_name: name,
-        visibility: (data.count / totalChats) * 100,
-        avg_position: data.totalPosition / data.count,
-        avg_sentiment: data.totalSentiment / data.count
-    })).sort((a, b) => b.visibility - a.visibility)
+    // A domain counts once per chat however many times that chat cited it, and Prisma's _count
+    // is not distinct-aware, so this one stays raw. A domain can be filed under several types
+    // across answers; OTHER is the extractor's fallback, so the most frequent real type wins
+    // and OTHER is only reported when nothing else was ever recorded.
+    const chatWhereSql = buildChatWhereSql(project_id, filters ?? {})
+    const sourceRows = await prisma.$queryRaw<Array<{ domain: string, source_type: string, chat_count: number }>>`
+        SELECT
+            s.domain,
+            COALESCE(
+                mode() WITHIN GROUP (ORDER BY s.source_type) FILTER (WHERE s.source_type <> 'OTHER'),
+                'OTHER'
+            )::text AS source_type,
+            COUNT(DISTINCT s.chat_id)::int AS chat_count
+        FROM "Source" s
+        JOIN "Chat" c ON c.id = s.chat_id
+        JOIN "Prompt" p ON p.id = c.prompt_id
+        WHERE ${chatWhereSql}
+        GROUP BY s.domain
+        ORDER BY chat_count DESC, s.domain ASC
+        LIMIT ${TOP_SOURCES_LIMIT}
+    `
 
-    const sourceMap = new Map<string, { count: number, type: string }>()
-
-    for (const chat of chats) {
-        const uniqueDomains = new Set(chat.sources.map(s => s.domain))
-        for (const domain of uniqueDomains) {
-            const sourceInfo = chat.sources.find(s => s.domain === domain)
-            const existing = sourceMap.get(domain) || { count: 0, type: sourceInfo?.source_type || 'OTHER' }
-            sourceMap.set(domain, { count: existing.count + 1, type: existing.type })
-        }
-    }
-
-    const topSources = Array.from(sourceMap.entries()).map(([domain, data]) => ({
-        domain,
-        source_type: data.type,
-        usage_percentage: (data.count / totalChats) * 100
-    })).sort((a, b) => b.usage_percentage - a.usage_percentage)
+    const topSources = sourceRows.map(row => ({
+        domain: row.domain,
+        source_type: row.source_type,
+        usage_percentage: (row.chat_count / totalChats) * 100
+    }))
 
     return {
         brand: {
@@ -477,80 +579,94 @@ export async function getDashboardData({ project_id, filters }: { project_id: st
 }
 
 export async function getVisibilityTimeSeries(project_id: string, filters?: DashboardFilters) {
-    const chatWhere = buildChatWhere(project_id, filters || {})
-
-    const chats = await prisma.chat.findMany({
-        where: chatWhere,
-        select: {
-            created_at: true,
-            brand_mentioned: true,
-            brand_mentions: {
-                select: {
-                    brand_name: true,
-                    domain: true,
-                },
-            },
-            run: { select: { ran_at: true } }
-        },
-        orderBy: { created_at: 'asc' }
-    })
-
-    const dayMap = new Map<string, { total: number; brandHit: number; competitorHits: Map<string, number> }>()
+    const chatWhereSql = buildChatWhereSql(project_id, filters || {})
 
     const project = await prisma.project.findUniqueOrThrow({
         where: { id: project_id },
         include: { competitors: true }
     })
-    const mentionDomains = new Map<string, string>()
-    for (const chat of chats) {
-        for (const mention of chat.brand_mentions) {
-            const domain = normalizeEntityDomain(mention.domain)
-            if (domain && !mentionDomains.has(mention.brand_name)) {
-                mentionDomains.set(mention.brand_name, domain)
-            }
-        }
-    }
-
-    for (const chat of chats) {
-        const dateKey = chat.run.ran_at.toISOString().slice(0, 10)
-        const existing = dayMap.get(dateKey) ?? {
-            total: 0,
-            brandHit: 0,
-            competitorHits: new Map<string, number>()
-        }
-
-        existing.total += 1
-        if (chat.brand_mentioned) existing.brandHit += 1
-
-        for (const mention of chat.brand_mentions) {
-            const count = existing.competitorHits.get(mention.brand_name) ?? 0
-            existing.competitorHits.set(mention.brand_name, count + 1)
-        }
-
-        dayMap.set(dateKey, existing)
-    }
-
     const competitorNames = project.competitors.map(c => c.name)
 
-    return Array.from(dayMap.entries())
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([date, data]) => {
-            const brands: Record<string, number> = {
-                [project.brand_name]: data.total > 0 ? (data.brandHit / data.total) * 100 : 0
-            }
-            const brand_domains: Record<string, string | null> = {
-                [project.brand_name]: normalizeEntityDomain(project.brand_url),
-            }
-            for (const name of competitorNames) {
-                const hits = data.competitorHits.get(name) ?? 0
-                brands[name] = data.total > 0 ? (hits / data.total) * 100 : 0
-                const configuredUrl = project.competitors.find(competitor => competitor.name === name)?.url
-                brand_domains[name] = normalizeEntityDomain(configuredUrl)
-                    ?? mentionDomains.get(name)
-                    ?? null
-            }
-            return { date, total_chats: data.total, brands, brand_domains }
-        })
+    // The series is plotted against Run.ran_at, the day the answers were actually collected,
+    // which is also the timestamp the chat lists hand the client. date_trunc on a
+    // "timestamp without time zone" column holding UTC gives the same day boundary the old
+    // toISOString().slice(0, 10) did, without a time-zone-dependent conversion.
+    const dayRows = await prisma.$queryRaw<Array<{ date: string, total_chats: number, brand_hits: number }>>`
+        SELECT
+            to_char(date_trunc('day', r.ran_at), 'YYYY-MM-DD') AS date,
+            COUNT(*)::int AS total_chats,
+            (COUNT(*) FILTER (WHERE c.brand_mentioned))::int AS brand_hits
+        FROM "Chat" c
+        JOIN "Prompt" p ON p.id = c.prompt_id
+        JOIN "Run" r ON r.id = c.run_id
+        WHERE ${chatWhereSql}
+        GROUP BY 1
+        ORDER BY 1 ASC
+    `
+
+    if (dayRows.length === 0) return []
+
+    // Only the configured competitors are ever read back out, so the grouping is bounded by
+    // days x competitors instead of by the number of mentions in the period.
+    const competitorRows = competitorNames.length === 0 ? [] : await prisma.$queryRaw<Array<{ date: string, brand_name: string, hits: number }>>`
+        SELECT
+            to_char(date_trunc('day', r.ran_at), 'YYYY-MM-DD') AS date,
+            bm.brand_name,
+            COUNT(*)::int AS hits
+        FROM "BrandMention" bm
+        JOIN "Chat" c ON c.id = bm.chat_id
+        JOIN "Prompt" p ON p.id = c.prompt_id
+        JOIN "Run" r ON r.id = c.run_id
+        WHERE ${chatWhereSql}
+          AND bm.brand_name = ANY(${competitorNames}::text[])
+        GROUP BY 1, 2
+    `
+
+    const competitorHits = new Map<string, number>()
+    for (const row of competitorRows) {
+        competitorHits.set(`${row.date} ${row.brand_name}`, row.hits)
+    }
+
+    // Fallback domain for a competitor with no URL on record: the first one an answer reported
+    // for that name, oldest run first, exactly as the old first-wins pass over the chats did.
+    const mentionDomainRows = competitorNames.length === 0 ? [] : await prisma.$queryRaw<Array<{ brand_name: string, domain: string }>>`
+        SELECT bm.brand_name, bm.domain
+        FROM "BrandMention" bm
+        JOIN "Chat" c ON c.id = bm.chat_id
+        JOIN "Prompt" p ON p.id = c.prompt_id
+        JOIN "Run" r ON r.id = c.run_id
+        WHERE ${chatWhereSql}
+          AND bm.domain IS NOT NULL
+          AND bm.brand_name = ANY(${competitorNames}::text[])
+        GROUP BY bm.brand_name, bm.domain
+        ORDER BY bm.brand_name ASC, MIN(r.ran_at) ASC, MIN(c.created_at) ASC, bm.domain ASC
+    `
+
+    const mentionDomains = new Map<string, string>()
+    for (const row of mentionDomainRows) {
+        const domain = normalizeEntityDomain(row.domain)
+        if (domain && !mentionDomains.has(row.brand_name)) {
+            mentionDomains.set(row.brand_name, domain)
+        }
+    }
+
+    return dayRows.map(day => {
+        const brands: Record<string, number> = {
+            [project.brand_name]: day.total_chats > 0 ? (day.brand_hits / day.total_chats) * 100 : 0
+        }
+        const brand_domains: Record<string, string | null> = {
+            [project.brand_name]: normalizeEntityDomain(project.brand_url),
+        }
+        for (const name of competitorNames) {
+            const hits = competitorHits.get(`${day.date} ${name}`) ?? 0
+            brands[name] = day.total_chats > 0 ? (hits / day.total_chats) * 100 : 0
+            const configuredUrl = project.competitors.find(competitor => competitor.name === name)?.url
+            brand_domains[name] = normalizeEntityDomain(configuredUrl)
+                ?? mentionDomains.get(name)
+                ?? null
+        }
+        return { date: day.date, total_chats: day.total_chats, brands, brand_domains }
+    })
 }
 
 export async function getRecentChats(project_id: string, filters?: DashboardFilters, limit = 9) {

@@ -3,6 +3,7 @@ import type { AuthenticatedRequest } from "../../middleware/auth"
 import { getCreditBalance, getCreditTransactions, isLowBalance, getBillingAudience, grantDueAnnualSubscriptionCreditsForUser, createCreditPackCheckoutSession } from "./credits_service"
 import { AGENCY_CREDIT_PACKS, CREDIT_PACKS } from "./credits_config"
 import { publicBillingCatalog } from "./billing_catalog"
+import { resolveErrorResponse } from "../../lib/http_error"
 
 /** GET /api/payments/balance */
 export async function getBalanceController(req: Request, res: Response): Promise<void> {
@@ -38,17 +39,9 @@ export async function createCreditPackCheckoutController(req: Request, res: Resp
         const checkout = await createCreditPackCheckoutSession(userId, { pack_id, custom_credits }, request_id)
         res.status(201).json(checkout)
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to create checkout session"
-        const statusCode =
-            message === "Invalid credit pack" ? 400 :
-            message === "User not found" ? 404 :
-            500
-        if (statusCode === 500) {
-            console.error("[payments_controller:createCreditPackCheckout]", error)
-            res.status(500).json({ error: "Failed to create checkout session" })
-            return
-        }
-        res.status(statusCode).json({ error: message })
+        const { status, message, unexpected } = resolveErrorResponse(error, "Failed to create checkout session")
+        if (unexpected) console.error("[payments_controller:createCreditPackCheckout]", error)
+        res.status(status).json({ error: message })
     }
 }
 

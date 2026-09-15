@@ -1,5 +1,6 @@
 import prisma from "../../lib/prisma"
 import type { ProductTourStatus } from "./product_tour_types"
+import { httpError } from "../../lib/http_error"
 
 export async function getProductTourStatus(userId: string): Promise<ProductTourStatus> {
     const user = await prisma.user.findUnique({
@@ -11,7 +12,7 @@ export async function getProductTourStatus(userId: string): Promise<ProductTourS
     })
 
     if (!user) {
-        throw new Error("User not found")
+        throw httpError(404, "User not found")
     }
 
     return {

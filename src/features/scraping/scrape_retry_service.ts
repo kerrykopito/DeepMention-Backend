@@ -1,6 +1,6 @@
 import { Engine, ScrapeJobStatus, VisibilityRunStatus } from "@prisma/client"
 import prisma from "../../lib/prisma"
-import { ACTIVE_SCRAPE_ENGINES, isActiveScrapeEngine } from "./scrape_engine_policy"
+import { ACTIVE_SCRAPE_ENGINES, activeConfiguredEngines, isActiveScrapeEngine } from "./scrape_engine_policy"
 import { getProjectEngines } from "../project_engines/project_engines_service"
 import { assertScrapingEnabled } from "./scrape_gate"
 
@@ -29,12 +29,22 @@ export async function retryFailedJobsForRun(run_id: string) {
         orderBy: { created_at: "asc" },
     })
 
-    const selectedEngineSet = new Set(await getProjectEngines(run.project_id))
+    // The same intersection the enqueue path takes: an engine the project selected, that this
+    // build scrapes, and that this runtime has a Bright Data scraper id for. The third test
+    // was missing here, so a retry could requeue an engine whose id is unset - the job would
+    // be accepted, then throw "scraper ID is missing" once per attempt. That is precisely the
+    // failure activeConfiguredEngines() was written to prevent on the enqueue side, and it was
+    // still reachable through POST /runs/:run_id/retry-failed.
+    const configuredEngineSet = new Set(activeConfiguredEngines())
+    const projectEngineSet = new Set(await getProjectEngines(run.project_id))
+    const isRetryableEngine = (engine: Engine) =>
+        isActiveScrapeEngine(engine) && projectEngineSet.has(engine) && configuredEngineSet.has(engine)
+
     const eligibleJobs = failedJobs.filter(job => (
-        isActiveScrapeEngine(job.engine) && selectedEngineSet.has(job.engine) && job.retry_count < MAX_MANUAL_SCRAPE_RETRIES
+        isRetryableEngine(job.engine) && job.retry_count < MAX_MANUAL_SCRAPE_RETRIES
     ))
     const exhaustedJobs = failedJobs.filter(job => (
-        isActiveScrapeEngine(job.engine) && selectedEngineSet.has(job.engine) && job.retry_count >= MAX_MANUAL_SCRAPE_RETRIES
+        isRetryableEngine(job.engine) && job.retry_count >= MAX_MANUAL_SCRAPE_RETRIES
     ))
     const unsupportedJobs = failedJobs.filter(job => job.engine === Engine.GOOGLE_AI_OVERVIEW)
 
@@ -59,7 +69,9 @@ export async function retryFailedJobsForRun(run_id: string) {
                 status: ScrapeJobStatus.FAILED,
                 chat_id: null,
                 retry_count: { lt: MAX_MANUAL_SCRAPE_RETRIES },
-                engine: { in: [...ACTIVE_SCRAPE_ENGINES].filter(engine => selectedEngineSet.has(engine)) },
+                // Same predicate the eligibility filter used, so the guard in the WHERE clause
+                // and the list of ids it is guarding cannot disagree.
+                engine: { in: [...ACTIVE_SCRAPE_ENGINES].filter(isRetryableEngine) },
             },
             data: {
                 status: ScrapeJobStatus.QUEUED,

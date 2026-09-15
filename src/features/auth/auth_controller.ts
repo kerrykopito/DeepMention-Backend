@@ -1,7 +1,9 @@
 import { Request, Response } from 'express'
 import { z } from 'zod'
-import { refreshAccessToken, registerUser, resetPasswordWithOtp, sendForgotPasswordOtp, verifyUserOtp, login as loginService } from './auth_service'
+import { EMAIL_NOT_VERIFIED, refreshAccessToken, registerUser, resetPasswordWithOtp, sendForgotPasswordOtp, verifyUserOtp, login as loginService } from './auth_service'
 import { clearAuthCookies, readRefreshTokenCookie, setAuthCookies } from '../../utils/auth_cookies'
+import { EMAIL_DELIVERY_FAILED } from '../email/email_service'
+import { getErrorCode, isDatabaseUnreachable, resolveErrorResponse } from '../../lib/http_error'
 
 /** Messages auth_service throws deliberately for the client. Anything else is internal. */
 const EXPECTED_AUTH_ERRORS = new Set([
@@ -53,24 +55,23 @@ export async function register(req: Request, res: Response): Promise<void> {
         const result = await registerUser(parsed.data)
         res.status(201).json({ success: true, ...result })
     } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : 'Registration failed'
-        const isEmailDeliveryError = message.includes('Brevo email send failed')
-        const status =
-            message.includes('already exists') ? 409
-                : message.includes('work/business') ? 422
-                    : isEmailDeliveryError ? 502
-                    : 500
-        if (status === 500) {
-            console.error('[auth_controller:register]', err)
-            res.status(500).json({ success: false, message: 'Registration failed. Please try again.' })
+        // The mail provider's own error text is not something to show a user, so this one
+        // failure is recognised by its code and answered with a sentence of ours. Everything
+        // else - the duplicate account, the personal-email rejection - now carries the status
+        // it should be reported with, instead of being identified by a word in the sentence.
+        if (getErrorCode(err) === EMAIL_DELIVERY_FAILED) {
+            res.status(502).json({
+                success: false,
+                message: "We could not send your verification code right now. Please try again in a moment.",
+            })
             return
         }
-        res.status(status).json({
-            success: false,
-            message: isEmailDeliveryError
-                ? "We could not send your verification code right now. Please try again in a moment."
-                : message,
-        })
+
+        const { status, message, unexpected } = resolveErrorResponse(err, 'Registration failed. Please try again.')
+        if (unexpected) {
+            console.error('[auth_controller:register]', err)
+        }
+        res.status(status).json({ success: false, message })
     }
 }
 
@@ -132,15 +133,21 @@ export async function login(req: Request, res: Response): Promise<void> {
         setAuthCookies(res, result)
         res.status(200).json({ success: true, ...result })
     } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : 'Login failed'
-        if (message.includes("Can't reach database") || message.includes("DatabaseNotReachable") || message.includes("P1001")) {
+        // A login that never reached the database is not a rejected credential, and saying so
+        // is not a leak: it reveals nothing about whether the account exists.
+        if (isDatabaseUnreachable(err)) {
             res.status(503).json({ success: false, message: 'Database is currently unreachable. Please check database connection.' })
             return
         }
-        if (message.toLowerCase().includes('verify your email')) {
+        // The unverified account is the single login failure answered with 403, and it is
+        // identified by the code the service attaches rather than by its wording.
+        if (getErrorCode(err) === EMAIL_NOT_VERIFIED) {
             res.status(403).json({ success: false, message: 'Please verify your email using the verification code sent to your inbox before logging in.' })
             return
         }
+        // Everything else is 401 with a deliberately vague message, so that a wrong password
+        // and an address with no account remain indistinguishable. The status a service may
+        // have attached is ignored here on purpose, for the same reason.
         res.status(401).json({ success: false, message: clientMessage(err, 'login', 'Login failed') })
     }
 }
@@ -159,8 +166,9 @@ export async function forgotPasswordSendOtp(req: Request, res: Response): Promis
         const result = await sendForgotPasswordOtp(parsed.data.email)
         res.status(200).json({ success: true, ...result })
     } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : 'Failed to send password reset OTP'
-        const isEmailDeliveryError = message.includes('Brevo email send failed')
+        // Recognised by the same code as in register, since this is the same throw; only the
+        // sentence shown to the user differs, because the two routes send different mail.
+        const isEmailDeliveryError = getErrorCode(err) === EMAIL_DELIVERY_FAILED
         if (!isEmailDeliveryError) console.error('[auth_controller:forgotPasswordSendOtp]', err)
         res.status(isEmailDeliveryError ? 502 : 500).json({
             success: false,

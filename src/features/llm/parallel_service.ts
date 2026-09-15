@@ -1,4 +1,5 @@
 import Parallel from 'parallel-web'
+import { withRetry } from '../../lib/retry'
 
 export async function researchBrand(brand_name: string, brand_url: string) {
     if (!process.env.PARALLEL_API_KEY) {
@@ -7,7 +8,9 @@ export async function researchBrand(brand_name: string, brand_url: string) {
 
     const client = new Parallel({ apiKey: process.env.PARALLEL_API_KEY })
 
-    const taskRun = await client.taskRun.create({
+    // The create call is the one Parallel step with no timeout and no retry; the poll loop
+    // below already tolerates slowness. A failure here wasted the whole brand-research step.
+    const taskRun = await withRetry(() => client.taskRun.create({
         input: { brand_name, brand_url },
         processor: 'base',
         task_spec: {
@@ -56,7 +59,7 @@ export async function researchBrand(brand_name: string, brand_url: string) {
                 },
             },
         },
-    })
+    }), { label: `parallel brand research ${brand_name}`, attempts: 3 })
 
     let runResult
     for (let i = 0; i < 144; i++) {

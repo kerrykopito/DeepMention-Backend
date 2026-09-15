@@ -5,7 +5,14 @@ import {
     TRIAL_PROJECT_REASON,
     TRIAL_PROMPT_REASON,
     evaluateProjectLimit,
+    EXTRA_COMPETITOR_CREDIT_RESERVE,
+    EXTRA_PROJECT_CREDIT_RESERVE,
+    EXTRA_PROMPT_CREDIT_RESERVE,
+    evaluateCompetitorLimit,
+    evaluatePromptLimit,
     paidPlanProjectReason,
+    toCapLimitCheck,
+    type CapLimitInput,
     toProjectLimitCheck,
     type ProjectLimitInput,
 } from "./plan_limits"
@@ -141,7 +148,7 @@ function paidUser(overrides: Partial<ProjectLimitInput> = {}): ProjectLimitInput
 const starterAtCap = evaluateProjectLimit(paidUser({ project_count: 1 }))
 assert.equal(starterAtCap.allowed, false)
 assert.equal(starterAtCap.project_limit, 1)
-assert.equal(starterAtCap.reason, paidPlanProjectReason("STARTER", 1))
+assert.equal(starterAtCap.reason, paidPlanProjectReason("STARTER", 1, EXTRA_PROJECT_CREDIT_RESERVE))
 assert.equal(starterAtCap.reason?.includes("1 brand workspace"), true)
 
 // Allowed: the same plan with no workspace yet.
@@ -180,4 +187,128 @@ assert.equal(oldSubstringMatch(paidPlanProjectReason("STARTER", 1)), true)
 assert.equal(new PlanLimitError(paidPlanProjectReason("STARTER", 1)) instanceof PlanLimitError, true)
 assert.equal(new PlanLimitError(TRIAL_PROJECT_REASON) instanceof PlanLimitError, true)
 
+// ── Credits as extra capacity ────────────────────────────────────────────────
+
+// A subscriber at the workspace cap gets past it by holding the reserve. Below it they are
+// still refused, so a token top-up cannot unlock an unbounded number of workspaces.
+assert.equal(evaluateProjectLimit(paidUser({
+    project_count: 1,
+    credits_remaining: EXTRA_PROJECT_CREDIT_RESERVE,
+})).allowed, true)
+assert.equal(evaluateProjectLimit(paidUser({
+    project_count: 1,
+    credits_remaining: EXTRA_PROJECT_CREDIT_RESERVE - 1,
+})).allowed, false)
+
+// The reserve is per workspace taken beyond the allowance, so the second extra one costs a
+// second reserve rather than riding along on the first purchase.
+assert.equal(evaluateProjectLimit(paidUser({
+    project_count: 2,
+    credits_remaining: EXTRA_PROJECT_CREDIT_RESERVE,
+})).allowed, false)
+assert.equal(evaluateProjectLimit(paidUser({
+    project_count: 2,
+    credits_remaining: EXTRA_PROJECT_CREDIT_RESERVE * 2,
+})).allowed, true)
+
+// The rejection names the price of "yes", not just the fact of "no".
+const overCapReason = evaluateProjectLimit(paidUser({ project_count: 1 })).reason ?? ""
+assert.equal(overCapReason.includes(String(EXTRA_PROJECT_CREDIT_RESERVE)), true)
+assert.equal(overCapReason.includes("credits"), true)
+
+// ── Prompts ──────────────────────────────────────────────────────────────────
+
+function promptUser(overrides: Partial<CapLimitInput> = {}): CapLimitInput {
+    return {
+        plan: "STARTER",
+        effective_plan: "STARTER",
+        trial_active: false,
+        trial_expired: false,
+        credits_remaining: 0,
+        used: 0,
+        requested: 1,
+        ...overrides,
+    }
+}
+
+// STARTER declares 15 prompts. Before this was wired, getPromptLimitForPlan had no caller at
+// all and a STARTER subscriber could create any number.
+assert.equal(evaluatePromptLimit(promptUser({ used: 14 })).allowed, true)
+assert.equal(evaluatePromptLimit(promptUser({ used: 15 })).allowed, false)
+assert.equal(evaluatePromptLimit(promptUser({ used: 15 })).limit, 15)
+
+// Credits carry the account past the prompt cap, one reserve per prompt over it.
+assert.equal(evaluatePromptLimit(promptUser({
+    used: 15,
+    credits_remaining: EXTRA_PROMPT_CREDIT_RESERVE,
+})).allowed, true)
+assert.equal(evaluatePromptLimit(promptUser({
+    used: 15,
+    requested: 2,
+    credits_remaining: EXTRA_PROMPT_CREDIT_RESERVE,
+})).allowed, false)
+assert.equal(evaluatePromptLimit(promptUser({
+    used: 15,
+    requested: 2,
+    credits_remaining: EXTRA_PROMPT_CREDIT_RESERVE * 2,
+})).allowed, true)
+
+// A running trial is capped by the trial rule, not the plan it has access to: the trial grants
+// GROWTH access, which declares 30 prompts, and the trial allows 10.
+assert.equal(evaluatePromptLimit(promptUser({
+    plan: "FREE",
+    effective_plan: "GROWTH",
+    trial_active: true,
+    used: 10,
+})).allowed, false)
+assert.equal(evaluatePromptLimit(promptUser({
+    plan: "FREE",
+    effective_plan: "GROWTH",
+    trial_active: true,
+    used: 9,
+})).allowed, true)
+assert.equal(evaluatePromptLimit(promptUser({
+    plan: "FREE",
+    effective_plan: "GROWTH",
+    trial_active: true,
+    used: 10,
+})).reason, TRIAL_PROMPT_REASON)
+
+// An expired trial with an empty wallet is refused before any allowance is considered.
+assert.equal(evaluatePromptLimit(promptUser({
+    plan: "FREE",
+    effective_plan: "FREE",
+    trial_expired: true,
+    used: 0,
+})).allowed, false)
+
+// ── Competitors ──────────────────────────────────────────────────────────────
+
+// STARTER declares 3. assertCanAddCompetitors used to return allowed unconditionally, so this
+// number applied to nobody.
+assert.equal(evaluateCompetitorLimit(promptUser({ used: 2 })).allowed, true)
+assert.equal(evaluateCompetitorLimit(promptUser({ used: 3 })).allowed, false)
+assert.equal(evaluateCompetitorLimit(promptUser({ used: 3 })).limit, 3)
+assert.equal(evaluateCompetitorLimit(promptUser({
+    used: 3,
+    credits_remaining: EXTRA_COMPETITOR_CREDIT_RESERVE,
+})).allowed, true)
+
+// Adding several at once is judged on the total, not one at a time — onboarding submits a
+// whole competitor list in a single call.
+assert.equal(evaluateCompetitorLimit(promptUser({ used: 0, requested: 3 })).allowed, true)
+assert.equal(evaluateCompetitorLimit(promptUser({ used: 0, requested: 4 })).allowed, false)
+
+// Reported numbers come from the verdict that was reached, never a second lookup.
+const promptCheck = toCapLimitCheck(evaluatePromptLimit(promptUser({ used: 15 })))
+assert.equal(promptCheck.feature, "prompt")
+assert.equal(promptCheck.allowed, false)
+assert.equal(promptCheck.limit, 15)
+assert.equal(promptCheck.used, 15)
+
+// Every rejection here is a PlanLimitError too, so none of them can regress into a 500 by
+// being reworded.
+assert.equal(new PlanLimitError(promptCheck.reason ?? "") instanceof PlanLimitError, true)
+
 console.log("Brand workspace limit checks passed.")
+console.log("Prompt, competitor and credit-extension checks passed.")

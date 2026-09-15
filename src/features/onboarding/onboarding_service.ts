@@ -3,10 +3,11 @@ import { generateBrandPrompts, summarizeBrandResearch } from "../llm/gemini_serv
 import prisma from "../../lib/prisma";
 import { crawlBrandWebsite } from "./brand_crawler_service";
 import type { BrandResearchInput, PromptInput, CreateProjectInput } from "./onboarding_types";
-import { assertCanAddCompetitors, assertCanCreateProjectWithPrompts } from "../subscription/subscription_service";
+import { assertCanAddCompetitors, assertCanCreatePrompts, assertCanCreateProjectWithPrompts } from "../subscription/subscription_service";
 import { getGeoCountryByName } from "../geo/countries";
 import { assertCanUseProjectEngines } from "../project_engines/project_engines_service";
 import { SELECTABLE_PROJECT_ENGINES } from "../project_engines/project_engine_policy";
+import { httpError } from "../../lib/http_error";
 
 export async function researchbrand(input: BrandResearchInput) {
     const { brand_url, brand_name } = input
@@ -67,7 +68,7 @@ export async function createProject(input: CreateProjectInput) {
         })
 
         if (!user) {
-            throw new Error('User not found')
+            throw httpError(404, 'User not found')
         }
 
         const normalizedPrompts = [...new Map(prompts.map(prompt => {
@@ -83,17 +84,24 @@ export async function createProject(input: CreateProjectInput) {
         })).values()].filter(prompt => prompt.text.length >= 8 && prompt.text.length <= 500)
 
         const activePromptCount = normalizedPrompts.filter(prompt => prompt.selected).length
+        // Every rejection in this function carries its own status, 'User not found' above
+        // included - it used to be left as a bare Error, so an authenticated request for an
+        // account that no longer exists was reported as a server fault.
         if (activePromptCount === 0) {
-            throw new Error('Select at least one prompt for your first visibility run')
+            throw httpError(400, 'Select at least one prompt for your first visibility run')
         }
 
         await assertCanCreateProjectWithPrompts(user_id, activePromptCount)
+        // The workspace check above only weighs prompts inside its trial branch, so on a paid
+        // plan nothing here looked at the prompt count at all — the zod bound of 500 was the
+        // only ceiling, and a PRO plan's declared 75 could be walked straight past at setup.
+        await assertCanCreatePrompts(user_id, activePromptCount)
         await assertCanAddCompetitors(user_id, competitors.length)
         const selectedEngines = await assertCanUseProjectEngines(user_id, input.engines)
 
         const country = getGeoCountryByName(brand_location)
         if (!country) {
-            throw new Error('Please select a supported primary market')
+            throw httpError(400, 'Please select a supported primary market')
         }
 
         const project = await prisma.$transaction(async transaction => {

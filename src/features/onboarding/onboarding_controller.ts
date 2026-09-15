@@ -1,7 +1,7 @@
 import { Request, Response } from 'express'
 import { researchbrand, promptgeneration, createProject } from './onboarding_service'
 import type { AuthenticatedRequest } from '../../middleware/auth'
-import { PlanLimitError } from '../subscription/plan_limits'
+import { resolveErrorResponse } from '../../lib/http_error'
 import { z } from 'zod'
 
 const onboardingPromptSchema = z.object({
@@ -91,23 +91,13 @@ export const createProjectController = async (req: Request, res: Response): Prom
 
         res.status(201).json(project)
     } catch (error) {
-        // A plan limit is a decision of the product, not a server fault, so the user gets
-        // the real sentence and can act on it instead of seeing "Failed to create project".
-        if (error instanceof PlanLimitError) {
-            res.status(400).json({ error: error.message })
-            return
-        }
-
-        const message = error instanceof Error ? error.message : 'Failed to create project'
-        // The remaining substring checks stay only because the engine and validation paths
-        // still throw plain Errors; they should move to PlanLimitError too.
-        const status = message.includes('plan') || message.includes('Missing required') || message.includes('supported primary market') || message.includes('Select at least')
-            ? 400
-            : 500
-        if (status === 500) {
+        // A plan limit is a decision of the product, not a server fault, so the user gets the
+        // real sentence and can act on it instead of seeing "Failed to create project". The
+        // substring list that used to follow this branch is gone: the engine and validation
+        // paths now carry their own status, which is what that comment was waiting for.
+        const { status, message, unexpected } = resolveErrorResponse(error, 'Failed to create project')
+        if (unexpected) {
             console.error("[onboarding_controller:createProject]", error)
-            res.status(500).json({ error: "Failed to create project" })
-            return
         }
         res.status(status).json({ error: message })
     }

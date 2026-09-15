@@ -9,6 +9,7 @@ import prisma from "../../lib/prisma"
 import { ensureSignupBonusCredits, getCreditBalance, getPromptRunCreditCost } from "../payments/credits_service"
 import { getProjectEngines } from "../project_engines/project_engines_service"
 import { isScrapingDisabled } from "./scrape_gate"
+import { resolveErrorResponse } from "../../lib/http_error"
 
 export const enqueueProjectRunController = async (req: Request, res: Response): Promise<void> => {
     try {
@@ -74,16 +75,15 @@ export const enqueueProjectRunController = async (req: Request, res: Response): 
 
         res.status(202).json(result)
     } catch (error) {
-        if (error instanceof Error && error.message === "PROJECT_NOT_FOUND") {
-            res.status(404).json({ error: "Project not found" })
-            return
+        // "plan can track" was a sentence no service throws any more, so the trial engine cap
+        // - the one limit this endpoint can actually hit - fell through to a 500 with a
+        // generic message. It is a PlanLimitError now, and the read-only and not-found
+        // rejections from the access check carry their own statuses too.
+        const { status, message, unexpected } = resolveErrorResponse(error, "Failed to enqueue scrape run")
+        if (unexpected) {
+            console.error("[scraping_controller:enqueueScrapeRun]", error)
         }
-        if (error instanceof Error && (error.message.includes("Select at least") || error.message.includes("plan can track"))) {
-            res.status(400).json({ error: error.message })
-            return
-        }
-        console.error("[scraping_controller:enqueueScrapeRun]", error)
-        res.status(500).json({ error: "Failed to enqueue scrape run" })
+        res.status(status).json({ error: message })
     }
 }
 

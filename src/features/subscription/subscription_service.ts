@@ -14,11 +14,22 @@ import type {
     BillingInterval,
 } from "./subscription_types"
 import { getAccessPeriod, getEffectivePlanAccess } from "./entitlements"
-import { PlanLimitError, TRIAL_PROJECT_REASON, evaluateProjectLimit, toProjectLimitCheck, type ProjectLimitVerdict } from "./plan_limits"
+import {
+    PlanLimitError,
+    TRIAL_PROJECT_REASON,
+    evaluateCompetitorLimit,
+    evaluateProjectLimit,
+    evaluatePromptLimit,
+    toCapLimitCheck,
+    toProjectLimitCheck,
+    type CapLimitVerdict,
+    type ProjectLimitVerdict,
+} from "./plan_limits"
 import { getCreditBalance } from "../credits/credits_service"
 import { grantSubscriptionCredits } from "../payments/credits_service"
 import { getRefreshWindowStart } from "../refresh/refresh_window"
 import { getStripeClient, getStripeId, getStripePrice } from "./stripe_config"
+import { httpError } from "../../lib/http_error"
 
 const ACCESS_STATUSES: SubscriptionStatus[] = [
     SubscriptionStatus.ACTIVE,
@@ -28,7 +39,7 @@ const ACCESS_STATUSES: SubscriptionStatus[] = [
 
 function assertPaidPlan(plan: unknown): asserts plan is PaidPlan {
     if (plan !== Plan.STARTER && plan !== Plan.GROWTH && plan !== Plan.PRO) {
-        throw new Error("Invalid subscription plan")
+        throw httpError(400, "Invalid subscription plan")
     }
 }
 
@@ -103,7 +114,7 @@ async function getCurrentPeriod(userId: string): Promise<{ start: Date; end: Dat
 
 export async function createSubscription(input: CreateSubscriptionInput): Promise<CreateSubscriptionResponse> {
     assertPaidPlan(input.plan)
-    if (input.billing_interval !== "monthly" && input.billing_interval !== "annual") throw new Error("Invalid billing interval")
+    if (input.billing_interval !== "monthly" && input.billing_interval !== "annual") throw httpError(400, "Invalid billing interval")
     const stripe = getStripeClient()
     const stripePrice = getStripePrice(input.plan, input.billing_interval)
 
@@ -113,7 +124,7 @@ export async function createSubscription(input: CreateSubscriptionInput): Promis
     })
 
     if (!user) {
-        throw new Error("User not found")
+        throw httpError(404, "User not found")
     }
 
     const activeSubscription = await prisma.subscription.findFirst({
@@ -128,7 +139,7 @@ export async function createSubscription(input: CreateSubscriptionInput): Promis
     })
 
     if (activeSubscription) {
-        throw new Error("User already has an active subscription")
+        throw httpError(409, "User already has an active subscription")
     }
 
     const existingSubscription = await prisma.subscription.findFirst({
@@ -294,7 +305,10 @@ export async function syncSubscriptionFromStripe(stripeSubscription: Stripe.Subs
 
 export async function createBillingPortalSession(userId: string) {
     const subscription = await prisma.subscription.findFirst({ where: { user_id: userId, stripe_customer_id: { not: null } }, orderBy: { created_at: "desc" } })
-    if (!subscription?.stripe_customer_id) throw new Error("No Stripe billing account found")
+    // The user has never been to checkout, so there is no portal to open for them. That is a
+    // bad request rather than a fault, and the status travels with the error so the
+    // controller does not have to recognise the sentence.
+    if (!subscription?.stripe_customer_id) throw httpError(400, "No Stripe billing account found")
     const frontendUrl = resolveFrontendUrl()
     const session = await getStripeClient().billingPortal.sessions.create({ customer: subscription.stripe_customer_id, return_url: `${frontendUrl}/subscription` })
     return { url: session.url }
@@ -302,7 +316,7 @@ export async function createBillingPortalSession(userId: string) {
 
 export async function verifyCheckoutSession(userId: string, sessionId: string) {
     const session = await getStripeClient().checkout.sessions.retrieve(sessionId)
-    if (session.client_reference_id !== userId && session.metadata?.user_id !== userId) throw new Error("Checkout session not found")
+    if (session.client_reference_id !== userId && session.metadata?.user_id !== userId) throw httpError(404, "Checkout session not found")
     const subscriptionId = getStripeId(session.subscription)
     if (subscriptionId) await syncSubscriptionFromStripe(await getStripeClient().subscriptions.retrieve(subscriptionId))
     return {
@@ -376,18 +390,58 @@ export async function assertCanCreateProjectWithPrompts(userId: string, promptCo
     return { allowed: true }
 }
 
-// PAYG: no prompt limits — always allow
+/**
+ * Loads everything the prompt allowance needs and returns the verdict. Same contract as
+ * `evaluateCanCreateProject`: enforcement throws on it and `can/create-prompt` serialises it,
+ * so the number the user is shown is the number that will be applied.
+ *
+ * This used to be "PAYG: no prompt limits — always allow", which meant the per-plan prompt
+ * counts in plan_config were reported by /subscription/quota and honoured by nothing —
+ * getPromptLimitForPlan had no caller at all — while the trial cap was enforced against a
+ * hardcoded 10 a few lines below the constant that declares it.
+ */
+export async function evaluateCanCreatePrompts(userId: string, promptCount: number): Promise<CapLimitVerdict> {
+    const [access, credits] = await Promise.all([
+        getEffectivePlanAccess(userId),
+        getCreditBalance(userId),
+    ])
+    const used = await prisma.prompt.count({
+        where: { project: { user_id: userId }, is_active: true, status: "ACTIVE" },
+    })
+
+    return evaluatePromptLimit({
+        plan: access.plan,
+        effective_plan: access.effective_plan,
+        trial_active: access.trial.active,
+        trial_expired: access.trial.expired,
+        credits_remaining: credits.remaining,
+        used,
+        requested: promptCount,
+    })
+}
+
 export async function assertCanCreatePrompts(userId: string, promptCount = 1) {
-    const access = await getEffectivePlanAccess(userId)
-    const credits = await getCreditBalance(userId)
-    if (access.trial.expired && access.effective_plan === Plan.FREE && credits.remaining <= 0) {
-        throw new Error("Your free trial has ended. Please upgrade or add credits to add more prompts.")
-    }
-    if (access.trial.active) {
-        const used = await prisma.prompt.count({ where: { project: { user_id: userId }, is_active: true, status: "ACTIVE" } })
-        if (used + promptCount > 10) throw new Error("Your free trial includes up to 10 prompts. Add a plan or credits to continue.")
-    }
+    const verdict = await evaluateCanCreatePrompts(userId, promptCount)
+    if (!verdict.allowed) throw new PlanLimitError(verdict.reason ?? "Prompt limit reached.")
     return { allowed: true }
+}
+
+export async function evaluateCanAddCompetitors(userId: string, count: number): Promise<CapLimitVerdict> {
+    const [access, credits] = await Promise.all([
+        getEffectivePlanAccess(userId),
+        getCreditBalance(userId),
+    ])
+    const used = await prisma.competitor.count({ where: { project: { user_id: userId } } })
+
+    return evaluateCompetitorLimit({
+        plan: access.plan,
+        effective_plan: access.effective_plan,
+        trial_active: access.trial.active,
+        trial_expired: access.trial.expired,
+        credits_remaining: credits.remaining,
+        used,
+        requested: count,
+    })
 }
 
 export async function getMyPlan(userId: string): Promise<MyPlanResponse> {
@@ -434,21 +488,26 @@ export async function canCreateProject(userId: string): Promise<LimitCheckRespon
     return toProjectLimitCheck(verdict)
 }
 
+// Both reporting endpoints ask the same function the enforcement path asks, with a request of
+// one, so "may I add another?" and "what happens when I do?" cannot give different answers.
 export async function canCreatePrompt(userId: string): Promise<LimitCheckResponse> {
-    const user = await prisma.user.findUnique({ where: { id: userId }, select: { plan: true } })
-    return buildCheck("prompt", (user?.plan ?? "FREE") as Plan, "unlimited", 0, true)
+    return toCapLimitCheck(await evaluateCanCreatePrompts(userId, 1))
 }
 
 export async function canAddCompetitor(userId: string): Promise<LimitCheckResponse> {
-    const user = await prisma.user.findUnique({ where: { id: userId }, select: { plan: true } })
-    return buildCheck("competitor", (user?.plan ?? "FREE") as Plan, "unlimited", 0, true)
+    return toCapLimitCheck(await evaluateCanAddCompetitors(userId, 1))
 }
 
-export async function assertCanAddCompetitor(_userId: string) {
-    return { allowed: true, feature: "competitor" as const, plan: "FREE" as Plan, limit: "unlimited", used: 0 }
+export async function assertCanAddCompetitor(userId: string) {
+    return assertCanAddCompetitors(userId, 1)
 }
 
-export async function assertCanAddCompetitors(_userId: string, _count: number) {
+export async function assertCanAddCompetitors(userId: string, count: number) {
+    // Adding nothing is always allowed. Onboarding posts an empty competitor list on every
+    // launch, so without this a zero-length request would spend two queries to prove it.
+    if (count <= 0) return { allowed: true }
+    const verdict = await evaluateCanAddCompetitors(userId, count)
+    if (!verdict.allowed) throw new PlanLimitError(verdict.reason ?? "Competitor limit reached.")
     return { allowed: true }
 }
 
@@ -483,9 +542,26 @@ export async function canRunRefresh(userId: string, projectId?: string): Promise
     return buildCheck("refresh", access.effective_plan, "daily", 0, true)
 }
 
+/**
+ * Exports are an entitlement rather than a quantity, so there is no credit route past it: the
+ * plan either includes them or it does not. This read the user's plan from the database and
+ * then returned `allowed: true, limit: "full"` regardless of it, which is why FREE's declared
+ * `exports: "none"` never applied to anyone.
+ */
 export async function canExport(userId: string): Promise<LimitCheckResponse> {
-    const user = await prisma.user.findUnique({ where: { id: userId }, select: { plan: true } })
-    return buildCheck("export", (user?.plan ?? "FREE") as Plan, "full", 0, true)
+    const access = await getEffectivePlanAccess(userId)
+    const exports = access.limits.exports
+    if (exports === "none") {
+        return buildCheck(
+            "export",
+            access.plan,
+            "none",
+            0,
+            false,
+            "Your plan does not include exports. Upgrade to download your data.",
+        )
+    }
+    return buildCheck("export", access.plan, exports, 0, true)
 }
 
 

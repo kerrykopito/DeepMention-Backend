@@ -1,8 +1,10 @@
 import prisma from "../../lib/prisma"
 import { getCreditBalance } from "../credits/credits_service"
+import { getEffectivePlanAccess } from "../subscription/entitlements"
+import { httpError } from "../../lib/http_error"
 
 export async function getProfileData(userId: string) {
-    const [user, projects, wallet, planUsage] = await Promise.all([
+    const [user, projects, wallet, planUsage, access] = await Promise.all([
         prisma.user.findUnique({
             where: { id: userId },
             select: {
@@ -40,10 +42,11 @@ export async function getProfileData(userId: string) {
                 period_end: true,
             },
         }),
+        getEffectivePlanAccess(userId),
     ])
 
     if (!user) {
-        throw new Error("User not found")
+        throw httpError(404, "User not found")
     }
 
     const { getAgencyContext } = await import("../agency/agency_service")
@@ -52,8 +55,15 @@ export async function getProfileData(userId: string) {
     return {
         user: {
             ...user,
-            plan: "PAYG",
-            effective_plan: "PAYG",
+            // The real plan, from the same source /subscription/quota reads, so the two
+            // endpoints cannot disagree about what the account is on. This used to select
+            // `plan` from the database above and then overwrite it with the literal "PAYG",
+            // which meant a paying subscriber had no way to see what they were paying for —
+            // and now that the plan's limits are actually enforced, no way to understand why
+            // a cap applied to them.
+            plan: access.plan,
+            effective_plan: access.effective_plan,
+            trial: access.trial,
             agency_role: agencyContext?.role || null,
         },
         projects,

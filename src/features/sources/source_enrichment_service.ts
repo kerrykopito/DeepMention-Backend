@@ -1,4 +1,5 @@
 import axios from "axios"
+import { withRetry } from "../../lib/retry"
 import https from "https"
 import { SourceType } from "@prisma/client"
 import prisma from "../../lib/prisma"
@@ -31,7 +32,13 @@ async function fetchHtmlWithSsrfGuard(url: string): Promise<string> {
     let currentUrl = url
     for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
         const safeUrl = await assertPublicUrl(currentUrl)
-        const response = await axios.get<string>(safeUrl.toString(), requestConfig)
+        // Source pages are arbitrary third-party sites and fail transiently far more often
+        // than an API does. Enrichment errors are swallowed further up, so without this a blip
+        // silently leaves a source with no content and no trace of why.
+        const response = await withRetry(
+            () => axios.get<string>(safeUrl.toString(), requestConfig),
+            { label: `source crawl ${currentUrl}`, attempts: 3 },
+        )
 
         const location = response.headers?.location
         if (response.status >= 300 && response.status < 400 && typeof location === "string") {

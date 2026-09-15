@@ -45,9 +45,23 @@ export default defineRailway(() => {
             // `!== "true"`, so this is belt and braces rather than the only protection.
             SCRAPER_API_FALLBACK_ENABLED: "false",
 
+            // Which model decides brand_mentioned, position and sentiment. Declared here
+            // rather than left to default, because this service's numbers are the product:
+            // it used to be chosen by whichever key the runtime held, so the same answer was
+            // scored by Kimi on a laptop and by Gemini here, with nothing recording which.
+            ANALYSIS_PROVIDER: "gemini",
+
             // One run's time budget. A drain that hits it exits non-zero, so an incomplete
             // sweep is visible rather than silent.
-            SCRAPE_DRAIN_MAX_MS: "900000",
+            //
+            // 30 minutes, not the 15 this used to be. A job takes 32-75s and concurrency is 5
+            // below, so a ~90-job backlog needs roughly 20 minutes - the figure the memory
+            // comment further down already assumes. At 15 the budget was shorter than the run
+            // it was budgeting for, so the drain would exit 1 every night having left work
+            // behind, and the backlog would grow rather than clear. The ceiling still exists
+            // to stop a stuck job billing until someone notices; it is just above the real
+            // number now instead of below it.
+            SCRAPE_DRAIN_MAX_MS: "1800000",
 
             // Jobs spend their time waiting on Bright Data rather than on CPU - a single job
             // takes 32-75s and uses almost none - so concurrency multiplies throughput almost

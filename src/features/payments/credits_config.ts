@@ -28,24 +28,12 @@ export function signupBonusFor(accountType: AccountType) {
     return 105 * creditPolicyFor(accountType).prompt_run
 }
 
-export const CREDIT_ACTIONS = {
-    // One successful prompt on one engine
-    PROMPT_RUN:       1,
-    EXPORT:           1,  // One data export (PDF / Excel)
-
-    // Heavy actions — 5 credits each
-    REDDIT_SCAN_STANDARD: 5,   // Standard Reddit Intelligence scan
-    REDDIT_SCAN_DEEP:     5,   // Deep Reddit Intelligence scan
-
-    // Site audits — tiered by depth (account-aware; actual cost resolved at runtime)
-    SEO_SITE_AUDIT:        10, // placeholder; real cost from getSiteAuditCreditCost()
-    SEO_SITE_AUDIT_REFUND: 0,  // refund marker, never directly deducted
-
-    // Signup bonus (positive credit awards)
-    SIGNUP_BONUS:     105, // 5 prompts × 3 engines × 7 trial days
-} as const
-
-export type CreditAction = keyof typeof CREDIT_ACTIONS
+// The per-action credit prices that used to live here are gone. They were a second, stale copy
+// of CREDIT_COSTS in subscription/plan_config.ts - a Reddit scan was priced at 5 here and
+// charged at 25 there - and nothing read them: their only consumer was getActionCreditCost,
+// reached solely through assertCredits and deductCredits, neither of which had a caller. Every
+// live charge goes through credits/credits_service.spendCredits with a cost from CREDIT_COSTS
+// or, for a prompt run, from ACCOUNT_CREDIT_POLICY above.
 
 /**
  * Credit pack options available for purchase.

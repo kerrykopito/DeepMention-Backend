@@ -5,6 +5,7 @@ import prisma from "../../lib/prisma"
 import { spendCredits, refundCredits } from "../credits/credits_service"
 import { assertProjectAccess } from "../projects/project_access"
 import { CREDIT_COSTS } from "../subscription/plan_config"
+import { getErrorStatus } from "../../lib/http_error"
 import { getEffectivePlanAccess } from "../subscription/entitlements"
 
 const REPORTS_API_BASE_URL = (
@@ -125,7 +126,10 @@ export async function generateReportController(req: Request, res: Response) {
             throw error
         }
     } catch (error) {
-        if (error instanceof Error && error.message.startsWith("Not enough credits")) {
+        // An empty wallet is a 402 because InsufficientCreditsError carries that status, not
+        // because of anything it says. The wording test this replaces never matched.
+        const creditStatus = getErrorStatus(error)
+        if (creditStatus === 402 && error instanceof Error) {
             res.status(402).json({ error: error.message })
             return
         }

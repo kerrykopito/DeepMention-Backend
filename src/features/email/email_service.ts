@@ -1,6 +1,7 @@
 import axios from "axios"
 import https from "https"
 import { SESClient, SendEmailCommand, SendRawEmailCommand } from "@aws-sdk/client-ses"
+import { httpError } from "../../lib/http_error"
 
 type SendEmailInput = {
     to: string
@@ -12,6 +13,9 @@ type SendEmailInput = {
         content: Buffer
     }>
 }
+
+/** Machine code for "the mail provider refused the send", which is never the caller's fault. */
+export const EMAIL_DELIVERY_FAILED = "EMAIL_DELIVERY_FAILED"
 
 const BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
 
@@ -125,7 +129,11 @@ export async function sendEmail(input: SendEmailInput & { awsConfig?: { region: 
                 fromEmail,
                 to: input.to,
             })
-            throw new Error(`Brevo email send failed${status ? ` (${status})` : ""}: ${brevoMessage}`)
+            // Tagged rather than reworded: the provider's own text is useful in the logs and
+            // must never reach a client, so the callers answer 502 with a sentence of their
+            // own. They select on the code, which is what they used to do by looking for
+            // "Brevo email send failed" inside this message.
+            throw httpError(502, `Brevo email send failed${status ? ` (${status})` : ""}: ${brevoMessage}`, EMAIL_DELIVERY_FAILED)
         }
         throw error
     }

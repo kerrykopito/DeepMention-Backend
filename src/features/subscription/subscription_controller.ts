@@ -17,6 +17,7 @@ import {
 } from "./subscription_service"
 import { handleStripeWebhook } from "./stripe_webhook_service"
 import { listBillingInvoices } from "./billing_invoice_service"
+import { getErrorStatus, resolveErrorResponse } from "../../lib/http_error"
 
 function fail500(res: Response, route: string, error: unknown, fallback: string): void {
     console.error(`[subscription_controller:${route}]`, error)
@@ -37,18 +38,14 @@ export async function createSubscriptionController(req: Request, res: Response):
 
         res.status(201).json(checkout)
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to create subscription"
-        const statusCode =
-            message === "Invalid subscription plan" ? 400 :
-            message === "User not found" ? 404 :
-            message === "User already has an active subscription" ? 409 :
-            500
-
-        if (statusCode === 500) {
+        // 400, 404 and 409 now travel on the errors themselves, so this no longer has to
+        // recognise three exact sentences to get the status right.
+        const { status, message, unexpected } = resolveErrorResponse(error, "Failed to create subscription")
+        if (unexpected) {
             fail500(res, "createSubscription", error, "Failed to create subscription")
             return
         }
-        res.status(statusCode).json({ error: message })
+        res.status(status).json({ error: message })
     }
 }
 
@@ -57,13 +54,14 @@ export async function createBillingPortalController(req: Request, res: Response)
         const { user: { id } } = req as AuthenticatedRequest
         res.json(await createBillingPortalSession(id))
     } catch (error) {
-        const message = error instanceof Error ? error.message : ""
-        if (message === "No Stripe billing account found") {
-            res.status(400).json({ error: message })
-            return
+        // An unrecognised failure has always been answered 400 here rather than 500. That is
+        // preserved rather than endorsed: this change is about classifying errors, not about
+        // restating what each route replies when something unexpected goes wrong.
+        const { status, message, unexpected } = resolveErrorResponse(error, "Failed to open billing portal", { fallbackStatus: 400 })
+        if (unexpected) {
+            console.error("[subscription_controller:createBillingPortal]", error)
         }
-        console.error("[subscription_controller:createBillingPortal]", error)
-        res.status(400).json({ error: "Failed to open billing portal" })
+        res.status(status).json({ error: message })
     }
 }
 
@@ -73,10 +71,15 @@ export async function verifyCheckoutController(req: Request, res: Response): Pro
         const sessionId = Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId
         res.json(await verifyCheckoutSession(id, sessionId))
     } catch (error) {
-        if (!(error instanceof Error && error.message === "Checkout session not found")) {
+        // This answered 404 unconditionally: a Stripe outage or a bug in verifyCheckoutSession
+        // was reported to the client as "Checkout session not found", which sends someone whose
+        // payment did go through looking for a session that exists. Only the deliberate 404 is
+        // a 404 now; anything else is logged and reported as the server fault it is.
+        const { status, message, unexpected } = resolveErrorResponse(error, "Failed to verify checkout session")
+        if (unexpected) {
             console.error("[subscription_controller:verifyCheckout]", error)
         }
-        res.status(404).json({ error: "Checkout session not found" })
+        res.status(status).json({ error: message })
     }
 }
 
@@ -128,9 +131,13 @@ export async function stripeWebhookController(req: Request, res: Response): Prom
 
         res.status(200).json(result)
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to handle Stripe webhook"
-        const isSignatureError = message.includes("signature") || message.includes("STRIPE_WEBHOOK_SECRET")
+        // Both branches are logged, because a rejected signature usually means a misconfigured
+        // endpoint secret rather than an attack. The failure to verify is tagged 400 where it
+        // is raised, so a webhook whose *processing* fails - which may well mention a
+        // signature somewhere in its message - is no longer reported to Stripe as a bad
+        // signature, which would have told it not to retry.
         console.error("[subscription_controller:stripeWebhook]", error)
+        const isSignatureError = getErrorStatus(error) === 400
         res.status(isSignatureError ? 400 : 500).json({
             error: isSignatureError ? "Invalid webhook signature" : "Failed to handle Stripe webhook",
         })

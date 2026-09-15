@@ -1,6 +1,7 @@
 import "../lib/env"
 import { Engine, ScrapeJobStatus, VisibilityRunStatus } from "@prisma/client"
 import { Worker } from "bullmq"
+import { createHash } from "node:crypto"
 import axios from "axios"
 import express from "express"
 import Redis from "ioredis"
@@ -11,7 +12,7 @@ import { runPrompt } from "../features/dashboard/dashboard_service"
 import { buildGeoPromptText } from "../features/prompts/prompt_service"
 import { runUiScrape, type UiEngine, type UiScrapeResult } from "../features/scraping/scraper_api_client"
 import { isScrapingDisabled } from "../features/scraping/scrape_gate"
-import { refundCredits, spendCredits } from "../features/credits/credits_service"
+import { spendCredits } from "../features/credits/credits_service"
 import { getPromptRunCreditCost } from "../features/payments/credits_service"
 
 const engineMap: Record<Engine, UiEngine> = {
@@ -42,8 +43,18 @@ const CACHE_TTL_SECONDS = Number(process.env.SCRAPE_CACHE_TTL_SECONDS ?? 72000)
  */
 function buildCacheKey(engine: UiEngine, geo: string, prompt: string): string {
     const normalizedPrompt = prompt.toLowerCase().replace(/\s+/g, " ").trim()
-    const hash = Buffer.from(`${engine}:${geo.toUpperCase()}:${normalizedPrompt}`).toString("base64url").slice(0, 40)
-    return `sc:v3:${hash}`
+    // A real hash, not an encoding. This was base64url(...).slice(0, 40) — base64url does not
+    // condense anything, so truncating to 40 characters kept only the first 30 bytes of the
+    // plaintext. After the "chatgpt:US:" prefix that left 19 characters of prompt text to tell
+    // two prompts apart, and "What are the best CRM tools for small businesses in Germany?"
+    // and "What are the best CRM platforms for enterprise teams?" produced the same key. A hit
+    // is served straight into the success path, so one project's answer was analysed against
+    // another project's brand and stored as a normal Chat row — and the cache is cross-user by
+    // design, so the collision crossed customers.
+    const hash = createHash("sha256").update(`${engine}:${geo.toUpperCase()}:${normalizedPrompt}`).digest("hex")
+    // v3 → v4 abandons every key written under the broken scheme rather than trusting it. The
+    // old namespace expires on its own within CACHE_TTL_SECONDS; nothing needs deleting.
+    return `sc:v4:${hash}`
 }
 
 function toScrapeJobStatus(status: UiScrapeResult["status"]) {
@@ -188,7 +199,41 @@ async function processScrapeJob(scrape_job_id: string) {
 
     if (status === ScrapeJobStatus.SUCCESS && result.answer_text) {
         const unitCreditCost = await getPromptRunCreditCost(scrapeJob.project.user_id)
+
+        // Charge AFTER the analysis has produced a Chat row, not before, and under a key that
+        // is constant for the job. That ordering is what makes the charge correct across
+        // retries, and it took two wrong shapes to get here:
+        //
+        //   Debit first, constant key. The debit row survives its own refund, so a retry
+        //   matched it, took spendCredits' idempotent early return, and wrote a Chat row
+        //   having charged nothing. Every retry after an analysis failure ran free.
+        //
+        //   Debit first, attempt-scoped key. Fixes the free run, but each attempt now has its
+        //   own key, and the refund is best-effort and outside the path that `prompt.update`
+        //   below throws on - so a failure after the debit committed billed the customer a
+        //   second time. Under-billing traded for over-billing.
+        //
+        // Charging last removes the refund entirely: work that does not finish is never
+        // charged for, so there is nothing to give back. The key stays constant, so if a later
+        // write throws and BullMQ retries, the second charge finds the first and no-ops. The
+        // wallet is still pre-checked when the run is enqueued, so an account that cannot pay
+        // is stopped before any of this costs anything.
         const chargeKey = `prompt-run:${scrapeJob.id}:v2`
+
+        const chat = await runPrompt({
+            prompt_id: scrapeJob.prompt_id,
+            run_id: scrapeJob.run_id,
+            geo_variant_id: scrapeJob.geo_variant_id,
+            geo_country_code: scrapeJob.geo_country_code,
+            geo_country_name: scrapeJob.geo_country_name,
+            geo_city: scrapeJob.geo_city,
+            raw_response: result.answer_text,
+            ai_model: servedFromCache ? `${result.model_label ?? engine}-cached` : result.model_label,
+            screenshot_path: result.screenshot_path,
+            citations: result.citations
+        })
+        chat_id = chat.id
+
         try {
             await spendCredits({
                 userId: scrapeJob.project.user_id,
@@ -207,33 +252,6 @@ async function processScrapeJob(scrape_job_id: string) {
             await refreshRunStatus(scrapeJob.run_id)
             throw error
         }
-
-        let chat
-        try {
-            chat = await runPrompt({
-                prompt_id: scrapeJob.prompt_id,
-                run_id: scrapeJob.run_id,
-                geo_variant_id: scrapeJob.geo_variant_id,
-                geo_country_code: scrapeJob.geo_country_code,
-                geo_country_name: scrapeJob.geo_country_name,
-                geo_city: scrapeJob.geo_city,
-                raw_response: result.answer_text,
-                ai_model: servedFromCache ? `${result.model_label ?? engine}-cached` : result.model_label,
-                screenshot_path: result.screenshot_path,
-                citations: result.citations
-            })
-        } catch (error) {
-            await refundCredits({
-                userId: scrapeJob.project.user_id,
-                amount: unitCreditCost,
-                action: "PROMPT_RUN",
-                description: "Refund for AI result that could not be analyzed",
-                idempotencyKey: chargeKey,
-                metadata: { run_id: scrapeJob.run_id, scrape_job_id: scrapeJob.id },
-            }).catch((refundError: unknown) => console.error("Could not refund failed AI analysis", refundError))
-            throw error
-        }
-        chat_id = chat.id
 
         await prisma.prompt.update({
             where: { id: scrapeJob.prompt_id },
@@ -332,8 +350,38 @@ worker.on("failed", async (job, error) => {
 })
 
 worker.on("stalled", async (jobId) => {
-    // A stalled job means the worker crashed mid-execution. Mark it failed in Postgres.
+    // A stall means the lock expired without the job finishing — the worker crashed or was
+    // killed mid-execution. Postgres still has the row as RUNNING, and nothing else ever
+    // moves it: refreshRunStatus only evaluates a run once every job is terminal, so one
+    // abandoned row keeps its whole run unresolved indefinitely.
+    //
+    // This handler used to only log, under a comment saying it marked the job failed.
+    //
+    // QUEUED rather than FAILED, because maxStalledCount is 1 and BullMQ re-queues a stalled
+    // job for one more attempt — the row should say what is actually true, which is that it is
+    // waiting to run again. If the retry stalls too, BullMQ moves it to failed and the
+    // "failed" handler above writes FAILED, so the two events stay consistent.
+    //
+    // enqueueScrapeJob passes `jobId: scrape_job_id`, so the id BullMQ reports here is the
+    // ScrapeJob primary key and needs no lookup.
     console.warn(`[worker] job stalled (worker crashed?): ${jobId}`)
+    try {
+        await prisma.scrapeJob.update({
+            where: { id: jobId },
+            data: {
+                status: ScrapeJobStatus.QUEUED,
+                started_at: null,
+                error_reason: "Worker stalled mid-run; requeued by BullMQ",
+            },
+        })
+    } catch (updateError) {
+        // A stale Redis job whose row has since been deleted is expected, not an incident.
+        if (updateError instanceof Error && updateError.message.includes("No record was found")) {
+            console.warn(`Scrape job ${jobId} no longer exists; ignoring stalled Redis job`)
+        } else {
+            console.error(`Could not reset stalled scrape job ${jobId}`, updateError)
+        }
+    }
 })
 
 if (process.env.PORT) {

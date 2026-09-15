@@ -1,6 +1,7 @@
 import { Plan, SubscriptionStatus } from "@prisma/client"
 import prisma from "../../lib/prisma"
 import { PLAN_LIMITS } from "./plan_config"
+import { TRIAL_ENGINE_LIMIT, TRIAL_PROJECT_LIMIT, TRIAL_PROMPT_LIMIT } from "./plan_limits"
 import type { PlanLimits } from "./subscription_types"
 
 export const FREE_TRIAL_DAYS = 7
@@ -128,8 +129,23 @@ export async function getEffectivePlanAccess(userId: string): Promise<EffectiveP
     ))
     const isFreeProductTrial = Boolean(trialActive && !subscription?.stripe_subscription_id && subscription?.amount_cents === 0)
     const effectivePlan = trialActive ? Plan.GROWTH : paidAccess ? subscription!.plan : Plan.FREE
+    // A free trial borrows GROWTH's allowances, but every allowance the trial caps separately
+    // has to be reported as the trial's own number — otherwise this endpoint advertises one
+    // figure while the enforcement path applies another.
+    //
+    // Each of the three below is the constant the corresponding assertion reads, not a
+    // lookalike: projects from evaluateProjectLimit's trial branch, prompts from the same,
+    // engines from assertCanUseProjectEngines. Reporting GROWTH's "all" for engines is what
+    // let the wizard offer five and then fail the launch on the fourth, and reporting FREE's
+    // five for prompts told a trial user they had half the ten they were actually entitled
+    // to — remaining.prompts read 0 for an account sitting exactly on its allowance.
     const limits = isFreeProductTrial
-        ? { ...PLAN_LIMITS.GROWTH, prompts: PLAN_LIMITS.FREE.prompts }
+        ? {
+            ...PLAN_LIMITS.GROWTH,
+            projects: TRIAL_PROJECT_LIMIT,
+            prompts: TRIAL_PROMPT_LIMIT,
+            engine_limit: TRIAL_ENGINE_LIMIT,
+        }
         : PLAN_LIMITS[effectivePlan]
 
     return {

@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { withRetry } from '../../../lib/retry'
 
 export type FirecrawlPage = {
     url: string
@@ -35,7 +36,10 @@ export async function scrapeWithFirecrawl(url: string): Promise<FirecrawlPage> {
         throw new Error('CRAWLER_API_KEY is missing; Firecrawl fallback cannot run.')
     }
 
-    const response = await axios.post<FirecrawlScrapeResponse>(
+    // Retried because this is the fallback the brand crawl reaches only when the cheap path
+    // has already failed — losing it to one dropped connection sends onboarding on to Parallel,
+    // a third provider and a third bill, for what a second attempt would usually have fixed.
+    const response = await withRetry(() => axios.post<FirecrawlScrapeResponse>(
         FIRECRAWL_SCRAPE_URL,
         {
             url,
@@ -51,7 +55,7 @@ export async function scrapeWithFirecrawl(url: string): Promise<FirecrawlPage> {
             timeout: 45000,
             validateStatus: status => status >= 200 && status < 500,
         }
-    )
+    ), { label: `firecrawl ${url}`, attempts: 3 })
 
     if (response.status >= 400 || response.data.success === false) {
         throw new Error(response.data.error || `Firecrawl scrape failed with status ${response.status}.`)

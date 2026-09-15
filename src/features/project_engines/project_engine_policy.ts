@@ -21,9 +21,17 @@ export function isSelectableProjectEngine(engine: Engine) {
     return selectableSet.has(engine)
 }
 
-// PAYG: all engines are available to every user
-export function getEngineLimitForPlan(_plan: Plan) {
-    return SELECTABLE_PROJECT_ENGINES.length
+/**
+ * How many engines a plan may track at once. `"all"` in the plan config means every engine
+ * this build offers, so it resolves against the selectable list rather than a second hardcoded
+ * five that would drift the moment an engine is added or retired.
+ *
+ * This used to ignore its argument and return the full count for everyone, which is how FREE's
+ * declared allowance of three came to be reported by /subscription/quota and enforced nowhere.
+ */
+export function getEngineLimitForPlan(plan: Plan) {
+    const limit = PLAN_LIMITS[plan]?.engine_limit ?? PLAN_LIMITS.FREE.engine_limit
+    return limit === "all" ? SELECTABLE_PROJECT_ENGINES.length : limit
 }
 
 export function normalizeProjectEngines(input: unknown): Engine[] {
