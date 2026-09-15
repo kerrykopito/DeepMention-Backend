@@ -1,3 +1,4 @@
+import { AGENCY_STAFF_WRITE_ROLES, canWriteToProject } from "./project_write_policy"
 import {
     assertAgencyProjectAccess,
     assertAgencyCompetitorAccess,
@@ -15,27 +16,56 @@ export async function assertProjectAccess(project_id: string, user_id: string) {
 
 export async function assertProjectMutationAccess(project_id: string, user_id: string) {
     const project = await assertProjectAccess(project_id, user_id)
-    
-    // Check if the user is accessing this project via a CLIENT_VIEWER link
-    if (project.user_id !== user_id) {
-        const prismaClient = (await import("../../lib/prisma")).default
-        const link = await prismaClient.agencyClientLink.findFirst({
-            where: {
-                agency_user_id: project.user_id,
-                client_user_id: user_id,
-                status: 'ACTIVE'
-            },
-            select: { role: true }
-        })
+    if (project.user_id === user_id) return project
 
-        // An allow-list, not a deny-list. Testing for CLIENT_VIEWER meant every other value
-        // granted write access, and `role` is an unconstrained String in the schema - so a
-        // typo, a new role added later, or the unvalidated role written by
-        // updateClientSettings would all fail open. Only the role that is meant to write can.
-        if (link?.role !== 'CLIENT_ADMIN') {
-            throw Object.assign(new Error("Read-only access: Client viewers cannot modify projects or prompts."), { status: 403 })
-        }
+    const prismaClient = (await import("../../lib/prisma")).default
+
+    // None of the three feeds another, so they resolve together rather than in sequence.
+    const [clientSeat, ownerIsMyClient, memberships] = await Promise.all([
+        // D: the project belongs to an agency the caller is a client of.
+        prismaClient.agencyClientLink.findFirst({
+            where: { agency_user_id: project.user_id, client_user_id: user_id, status: 'ACTIVE' },
+            select: { role: true },
+        }),
+        // A: the caller is an agency and the project's owner is one of its clients.
+        prismaClient.agencyClientLink.findFirst({
+            where: { agency_user_id: user_id, client_user_id: project.user_id, status: 'ACTIVE' },
+            select: { id: true },
+        }),
+        // B and C: the agencies the caller is active staff of.
+        prismaClient.agencyMembership.findMany({
+            where: { member_user_id: user_id, status: 'ACTIVE' },
+            select: { agency_user_id: true, role: true },
+        }),
+    ])
+
+    const staffAgencyIds = memberships
+        .filter(membership => AGENCY_STAFF_WRITE_ROLES.has(membership.role))
+        .map(membership => membership.agency_user_id)
+
+    // Only asked when the caller is staff somewhere, so the common case pays nothing for it.
+    const staffOfAgencyOwningClient = staffAgencyIds.length > 0
+        ? Boolean(await prismaClient.agencyClientLink.findFirst({
+            where: { agency_user_id: { in: staffAgencyIds }, client_user_id: project.user_id, status: 'ACTIVE' },
+            select: { id: true },
+        }))
+        : false
+
+    const allowed = canWriteToProject({
+        is_owner: false,
+        owner_is_my_client: Boolean(ownerIsMyClient),
+        staff_of_owning_agency: staffAgencyIds.includes(project.user_id),
+        staff_of_agency_owning_client: staffOfAgencyOwningClient,
+        client_seat_role: clientSeat?.role ?? null,
+    })
+
+    if (!allowed) {
+        throw Object.assign(
+            new Error("Read-only access: this account cannot modify projects or prompts in this workspace."),
+            { status: 403 },
+        )
     }
+
     return project
 }
 
