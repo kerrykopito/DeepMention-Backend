@@ -4,6 +4,17 @@ import * as emailService from "./email_campaign_service"
 import prisma from "../../../lib/prisma"
 import { assertProjectAccess, assertProjectMutationAccess } from "../../projects/project_access"
 import type { AuthenticatedRequest } from "../../../middleware/auth"
+import { httpError } from "../../../lib/http_error"
+
+// Express types a route parameter as `string | string[]`, so passing `req.params.id`
+// straight into the campaign service was a type error on three handlers here. It is also a
+// real request: a duplicated parameter arrives as an array, and the service would then look
+// up a campaign by an array and answer "not found" for a reason the caller cannot act on.
+// The thrown 400 carries its own status, which handleControllerError already honours.
+function readCampaignId(value: string | string[] | undefined): string {
+    if (typeof value !== "string" || !value) throw httpError(400, "Campaign id is required")
+    return value
+}
 
 // SECURITY: The tenant is still selected via the `x-project-id` header, but the
 // header value is no longer trusted on its own. Every handler now resolves the
@@ -162,7 +173,7 @@ export async function listCampaigns(req: Request, res: Response) {
 export async function getCampaign(req: Request, res: Response) {
     try {
         const projectId = await resolveProjectAccess(req, false)
-        const campaign = await emailService.getEmailCampaign(req.params.id, projectId)
+        const campaign = await emailService.getEmailCampaign(readCampaignId(req.params.id), projectId)
         // SECURITY: getEmailCampaign includes the account (with credentials) for the
         // ownership check; strip secrets before returning it to the client.
         res.json({ ...campaign, account: redactAccount(campaign.account) })
@@ -175,11 +186,12 @@ export async function uploadRecipients(req: Request, res: Response) {
     try {
         const projectId = await resolveProjectAccess(req, true)
         const { csv } = req.body
+        const campaignId = readCampaignId(req.params.id)
 
         // Verify the campaign belongs to this (now authorized) project
-        await emailService.getEmailCampaign(req.params.id, projectId)
+        await emailService.getEmailCampaign(campaignId, projectId)
 
-        const count = await emailService.addRecipientsFromCsv(req.params.id, csv)
+        const count = await emailService.addRecipientsFromCsv(campaignId, csv)
         res.json({ success: true, count })
     } catch (error: any) {
         handleControllerError(error, res)
@@ -189,7 +201,7 @@ export async function uploadRecipients(req: Request, res: Response) {
 export async function launchCampaign(req: Request, res: Response) {
     try {
         const projectId = await resolveProjectAccess(req, true)
-        await emailService.launchEmailCampaign(req.params.id, projectId)
+        await emailService.launchEmailCampaign(readCampaignId(req.params.id), projectId)
         res.json({ success: true })
     } catch (error: any) {
         handleControllerError(error, res)

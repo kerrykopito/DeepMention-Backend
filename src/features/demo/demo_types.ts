@@ -1,7 +1,8 @@
 export type DemoInput = {
     name: string,
     email: string,
-    company: string,
+    // Optional: the booking schema marks it optional and BookDemo.company is nullable.
+    company?: string,
     notes?: string,
     scheduledAt: Date,
     timezone: string,

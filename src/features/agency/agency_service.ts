@@ -299,11 +299,13 @@ export async function listAgencyDeliverables(agencyUserId: string, projectId?: s
     for (const b of briefs) {
         deliverables.push({
             id: b.id,
-            title: b.title || `Content Brief: ${b.primary_keyword}`,
+            // No keyword column on a brief: its topic is the closest stand-in, and every brief
+            // is anchored to a prompt, so that text is the fallback.
+            title: b.title || `Content Brief: ${b.topic ?? b.target_prompt_text}`,
             type: "BRIEF",
             clientName: b.project.brand_name,
             projectId: b.project.id,
-            targetKeyword: b.primary_keyword,
+            targetKeyword: b.topic ?? b.target_prompt_text,
             status: b.status || "READY",
             date: new Date(b.created_at).toLocaleDateString(),
             createdAt: b.created_at,
@@ -313,7 +315,8 @@ export async function listAgencyDeliverables(agencyUserId: string, projectId?: s
     for (const r of aiReports) {
         deliverables.push({
             id: r.id,
-            title: r.title || `${r.project.brand_name} AI Visibility Intelligence Report`,
+            // AI reports carry no title of their own, so the deliverable name is always derived.
+            title: `${r.project.brand_name} AI Visibility Intelligence Report`,
             type: "AI_REPORT",
             clientName: r.project.brand_name,
             projectId: r.project.id,

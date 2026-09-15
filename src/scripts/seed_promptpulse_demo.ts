@@ -407,7 +407,8 @@ async function main() {
   })
 
   const project = await prisma.project.upsert({
-    where: { brand_name: BRAND },
+    // brand_name alone is not unique; the model's unique key is [user_id, brand_name].
+    where: { user_id_brand_name: { user_id: user.id, brand_name: BRAND } },
     update: {
       brand_url: BRAND_URL,
       brand_location: "United States",

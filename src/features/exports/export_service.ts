@@ -482,7 +482,7 @@ async function buildExcel(
     wb.modified = new Date()
 
     // ── Cover / Meta sheet ────────────────────────────────────────────────────
-    const meta = wb.addWorksheet("Report Info", { tabColor: { argb: XL.blue } })
+    const meta = wb.addWorksheet("Report Info", { properties: { tabColor: { argb: XL.blue } } })
     meta.getColumn(1).width = 28
     meta.getColumn(2).width = 44
 
@@ -523,7 +523,7 @@ async function buildExcel(
     })
 
     // ── Data sheet ────────────────────────────────────────────────────────────
-    const ws = wb.addWorksheet("Data", { tabColor: { argb: XL.navy } })
+    const ws = wb.addWorksheet("Data", { properties: { tabColor: { argb: XL.navy } } })
 
     if (rows.length === 0) {
         ws.getCell("A1").value = "No data for the selected filters."
@@ -600,7 +600,15 @@ async function buildExcel(
     ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: keys.length } }
 
     // ── Set workbook active sheet ─────────────────────────────────────────────
-    wb.views = [{ activeTab: 1 }]  // "Data" sheet active on open
+    // WorkbookView requires every field, so the window geometry is spelled out with the same
+    // values exceljs's own renderer falls back to (x/y 0, 12000x24000) and firstSheet 0, which is
+    // the OOXML default - the emitted workbook is identical to passing activeTab alone.
+    wb.views = [{
+        x: 0, y: 0, width: 12000, height: 24000,
+        firstSheet: 0,
+        activeTab: 1,  // "Data" sheet active on open
+        visibility: "visible",
+    }]
 
     return Buffer.from(await wb.xlsx.writeBuffer() as ArrayBuffer)
 }
@@ -985,7 +993,9 @@ function renderFooter(doc: PDFKit.PDFDocument, brandName: string, page: number, 
     doc.text("DeepMention", 0, fy, { align: "center", lineBreak: false })
 
     const pgText = `Page ${page} of ${total}`
-    const pgW = doc.widthOfString(pgText, { fontSize: 7.5 })
+    // pdfkit measures at the document's current font size and ignores any size passed here, so the
+    // old { fontSize: 7.5 } was inert - fontSize(7.5) is already in effect from the line above.
+    const pgW = doc.widthOfString(pgText)
     doc.fillColor(PDF.muted).fontSize(7.5).font("Helvetica")
     doc.text(pgText, W - margin - pgW, fy, { lineBreak: false })
 }

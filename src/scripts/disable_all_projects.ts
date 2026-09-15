@@ -24,7 +24,7 @@ async function main() {
 
     // 2. Check for scrape jobs
     const activeStatuses = Object.values(ScrapeJobStatus).filter(
-        s => s !== ScrapeJobStatus.COMPLETED && s !== ScrapeJobStatus.FAILED
+        s => s !== ScrapeJobStatus.SUCCESS && s !== ScrapeJobStatus.FAILED
     )
     console.log("Active statuses to cancel:", activeStatuses)
 

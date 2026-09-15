@@ -3,6 +3,7 @@ import crypto from "crypto"
 import bcrypt from "bcryptjs"
 import prisma from "../../lib/prisma"
 import { assertAgencyManager, getAgencyContext } from "./agency_service"
+import { normalizeEntityDomain } from "../brands/brand_entity_policy"
 
 export type CreatePortalShareInput = {
     actorUserId: string
@@ -187,34 +188,38 @@ export async function getPublicPortalData(token: string, passcode?: string) {
         },
     }).catch(() => null)
 
+    // Snapshots are keyed by the researched domain, and a project can hold snapshots for
+    // competitor domains too, so match the client's own host or the portal could show a
+    // competitor's organic metrics as if they were the client's.
+    const brandDomain = normalizeEntityDomain(share.project.brand_url)
+
     // Fetch live project overview metrics
     const [latestRuns, latestOverviewSnapshot, topKeywordsSnapshot, recentBriefs] = await Promise.all([
         prisma.run.findMany({
             where: { project_id: share.project_id },
-            orderBy: { created_at: "desc" },
+            orderBy: { ran_at: "desc" },
             take: 10,
             select: {
                 id: true,
-                score: true,
-                sentiment_score: true,
-                created_at: true,
-                prompt: { select: { text: true } },
-                responses: {
+                ran_at: true,
+                // A run has no stored score; visibility is derived from its chats, the same
+                // mention-rate definition the agency dashboard uses.
+                chats: {
                     select: {
-                        engine: true,
                         brand_mentioned: true,
-                        rank: true,
+                        ai_model: true,
+                        scrape_job: { select: { engine: true } },
                     },
                 },
             },
         }),
         prisma.seoDomainResearchOverviewSnapshot.findFirst({
-            where: { domain: share.project.brand_url },
-            orderBy: { created_at: "desc" },
+            where: { project_id: share.project_id, ...(brandDomain ? { target_domain: brandDomain } : {}) },
+            orderBy: { fetched_at: "desc" },
         }),
         prisma.seoDomainResearchKeywordSnapshot.findFirst({
-            where: { domain: share.project.brand_url },
-            orderBy: { created_at: "desc" },
+            where: { project_id: share.project_id, ...(brandDomain ? { target_domain: brandDomain } : {}) },
+            orderBy: { fetched_at: "desc" },
         }),
         prisma.contentBrief.findMany({
             where: { project_id: share.project_id },
@@ -223,8 +228,8 @@ export async function getPublicPortalData(token: string, passcode?: string) {
             select: {
                 id: true,
                 title: true,
-                primary_keyword: true,
-                target_word_count: true,
+                topic: true,
+                target_prompt_text: true,
                 status: true,
                 created_at: true,
             },
@@ -232,8 +237,10 @@ export async function getPublicPortalData(token: string, passcode?: string) {
     ])
 
     // Calculate AI Visibility summary
-    const avgScore = latestRuns.length > 0
-        ? Math.round(latestRuns.reduce((acc, r) => acc + (r.score ?? 0), 0) / latestRuns.length)
+    const runChats = latestRuns.flatMap(r => r.chats)
+    const mentionedChats = runChats.filter(c => c.brand_mentioned).length
+    const avgScore = runChats.length > 0
+        ? Math.round((mentionedChats / runChats.length) * 100)
         : 68
 
     const engineMentions: Record<string, { total: number; mentioned: number }> = {
@@ -243,13 +250,16 @@ export async function getPublicPortalData(token: string, passcode?: string) {
         GOOGLE_AI_OVERVIEW: { total: 0, mentioned: 0 },
     }
 
-    for (const run of latestRuns) {
-        for (const resp of run.responses) {
-            const eng = resp.engine ?? "CHATGPT"
-            if (!engineMentions[eng]) engineMentions[eng] = { total: 0, mentioned: 0 }
-            engineMentions[eng].total += 1
-            if (resp.brand_mentioned) engineMentions[eng].mentioned += 1
-        }
+    for (const chat of runChats) {
+        // The scrape job is the only place the engine is recorded; ai_model holds a raw model
+        // label, so it is trusted only when it already names one of the known engines. Chats
+        // that match neither are skipped rather than credited to an arbitrary bucket.
+        const modelEngine = chat.ai_model?.toUpperCase()
+        const eng = chat.scrape_job?.engine ?? (modelEngine && modelEngine in engineMentions ? modelEngine : null)
+        if (!eng) continue
+        if (!engineMentions[eng]) engineMentions[eng] = { total: 0, mentioned: 0 }
+        engineMentions[eng].total += 1
+        if (chat.brand_mentioned) engineMentions[eng].mentioned += 1
     }
 
     const branding = share.agency.agency_branding ?? {
@@ -283,16 +293,26 @@ export async function getPublicPortalData(token: string, passcode?: string) {
                 share: data.total > 0 ? Math.round((data.mentioned / data.total) * 100) : 0,
                 total_queries: data.total,
             })),
-            seo_domain_overview: latestOverviewSnapshot?.metrics_json ?? {
+            seo_domain_overview: latestOverviewSnapshot?.payload ?? {
                 organic_traffic: 14200,
                 organic_keywords: 890,
                 domain_rating: 44,
                 ranking_distribution: { top3: 32, top10: 118, top50: 420 },
             },
-            top_keywords: topKeywordsSnapshot?.keywords_json ?? [],
+            top_keywords: topKeywordsSnapshot?.payload ?? [],
         },
         deliverables: {
-            content_briefs: recentBriefs,
+            // Keep the portal payload shape stable: a brief has no dedicated keyword column,
+            // so the topic (falling back to the prompt it targets) stands in, and there is no
+            // word-count target stored anywhere to derive.
+            content_briefs: recentBriefs.map(b => ({
+                id: b.id,
+                title: b.title,
+                primary_keyword: b.topic ?? b.target_prompt_text,
+                target_word_count: null,
+                status: b.status,
+                created_at: b.created_at,
+            })),
             available_exports: [
                 { type: "PPTX", name: "Monthly AI & SEO Executive Presentation", available: true },
                 { type: "PDF", name: "Executive Performance Audit Report", available: true },

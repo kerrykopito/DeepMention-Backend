@@ -75,7 +75,8 @@ const user = await prisma.user.upsert({
 })
 
 const project = await prisma.project.upsert({
-    where: { brand_name: 'Zoho CRM' },
+    // brand_name alone is not unique; the model's unique key is [user_id, brand_name].
+    where: { user_id_brand_name: { user_id: user.id, brand_name: 'Zoho CRM' } },
     update: {},
     create: {
         brand_name: 'Zoho CRM',

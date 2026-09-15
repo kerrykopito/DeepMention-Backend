@@ -13,7 +13,9 @@ async function main() {
     })
 
     try {
-        await queue.client.then(client => client.ping())
+        // BullMQ's IRedisClient adapter does not expose ping(); info() is the equivalent
+        // round-trip to the server, so an unreachable Redis still fails before we report below.
+        await queue.client.then(client => client.info())
 
         const queueCounts = await queue.getJobCounts(
             "waiting",

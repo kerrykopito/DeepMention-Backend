@@ -1,5 +1,6 @@
 import "../lib/env"
 import "dotenv/config"
+import { Prisma, SourceType } from "@prisma/client"
 import prisma from "../lib/prisma"
 
 /**
@@ -27,7 +28,9 @@ async function main() {
         const text = chat.raw_response ?? ""
         const existingDomains = new Set(chat.sources.map(s => s.domain))
 
-        const toCreate: { chat_id: string; url: string; domain: string; source_type: string; is_cited: boolean }[] = []
+        // Typed against the generated model so a future Source column change fails the
+        // typecheck here instead of silently skipping a field at runtime.
+        const toCreate: Prisma.SourceCreateManyInput[] = []
 
         // r/SaaS, r/MachineLearning etc. → reddit.com
         if (/\br\/[A-Za-z0-9_]+\b/.test(text) && !existingDomains.has("reddit.com")) {
@@ -35,7 +38,7 @@ async function main() {
                 chat_id: chat.id,
                 url: "https://reddit.com",
                 domain: "reddit.com",
-                source_type: "UGC",
+                source_type: SourceType.UGC,
                 is_cited: true,
             })
             redditAdded++
@@ -47,7 +50,7 @@ async function main() {
                 chat_id: chat.id,
                 url: "https://quora.com",
                 domain: "quora.com",
-                source_type: "UGC",
+                source_type: SourceType.UGC,
                 is_cited: true,
             })
             quoraAdded++

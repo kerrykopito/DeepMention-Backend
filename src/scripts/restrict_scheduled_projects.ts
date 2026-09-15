@@ -3,6 +3,10 @@ import "dotenv/config"
 import { PromptStatus, ScrapeJobStatus, VisibilityRunStatus } from "@prisma/client"
 import prisma from "../lib/prisma"
 
+// Annotated as the full enum: a bare literal array narrows includes() to just these two
+// members and rejects any other PromptStatus.
+const NON_ELIGIBLE_PROMPT_STATUSES: PromptStatus[] = [PromptStatus.ARCHIVED, PromptStatus.DELETED]
+
 function requestedEmails() {
     return (process.env.RESTRICT_SCHEDULE_EMAILS ?? "")
         .split(",")
@@ -92,7 +96,7 @@ async function main() {
                     prompt => prompt.is_active && prompt.status === PromptStatus.ACTIVE,
                 ).length,
                 eligible_inactive_prompts: project.prompts.filter(
-                    prompt => ![PromptStatus.ARCHIVED, PromptStatus.DELETED].includes(prompt.status),
+                    prompt => !NON_ELIGIBLE_PROMPT_STATUSES.includes(prompt.status),
                 ).length,
             })),
         })),

@@ -228,22 +228,12 @@ export const discoverPromptsController = async (req: Request, res: Response): Pr
     }
 }
 
-export const deletePromptController = async (req: Request, res: Response): Promise<void> => {
-    try {
-        const { prompt_id } = req.params
-        if (!prompt_id || Array.isArray(prompt_id)) {
-            res.status(400).json({ error: 'prompt_id is required' })
-            return
-        }
-
-        const user_id = (req as AuthenticatedRequest).user.id
-        await assertPromptMutationAccess(prompt_id, user_id)
-        await deletePrompt(prompt_id)
-        res.status(200).json({ success: true })
-    } catch (error) {
-        res.status(500).json({ error: 'Failed to delete prompt' })
-    }
-}
+// deletePromptController was removed here. It called deletePrompt(), which exists in no
+// module and never has, and no route imported the controller - so it could only ever have
+// thrown ReferenceError, and nothing could reach it to find out. Deleting a prompt is also
+// not a gap in the product: prompts are retired with deactivatePromptController below, which
+// is what the UI calls, and which keeps the Chats and ScrapeJobs already attached to them.
+// Bringing real deletion back means deciding what happens to that history first.
 
 export const activatePromptController = async (req: Request, res: Response): Promise<void> => {
     try {
